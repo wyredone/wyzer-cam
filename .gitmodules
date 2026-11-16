@@ -1,0 +1,4 @@
+[submodule "thingino"]
+	path = thingino
+	url = https://github.com/themactep/thingino-firmware.git
+	branch = ciao
