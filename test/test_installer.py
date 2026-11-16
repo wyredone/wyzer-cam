@@ -321,6 +321,47 @@ class RunonceTests(unittest.TestCase):
         self.assertNotIn("sk-test", log)
         self.assertNotIn("pa ss", log)
 
+    def test_web_page_installed_and_added_to_menu_once(self):
+        www = self.root / "var/www"
+        (www / "a").mkdir(parents=True)
+        (www / "x").mkdir()
+        stock = ("// Generated\n(function(){var cfg=window.thinginoUIConfig||{};window.thinginoUIConfig=cfg;"
+                 "cfg.plugins={\"prudynt\":{}};})();\n")
+        (www / "a/plugins.js").write_bytes(stock.encode())
+        for _ in range(2):
+            wi.prepare_card(self.card, settings(enable_motion=False))
+            result, log = self.run_card()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("ERROR", log)
+        self.assertIn("AI Alerts page", log)
+        for name in ("config-aiwatch.html", "a/config-aiwatch.js", "x/json-aiwatch.cgi",
+                     "a/plugins/aiwatch.webui.json"):
+            self.assertTrue((www / name).is_file(), name)
+        plugins = (www / "a/plugins.js").read_text(encoding="utf-8")
+        self.assertTrue(plugins.startswith(stock))
+        self.assertEqual(plugins.count("c.plugins.aiwatch="), 1)
+        node = shutil.which("node")
+        if node:  # the appended registration must be valid JavaScript
+            check = ("var window={};" + plugins +
+                     ";var p=window.thinginoUIConfig.plugins;"
+                     "if(!p.prudynt||p.aiwatch.nav[0].items[0].href!=='/config-aiwatch.html')process.exit(1);")
+            self.assertEqual(subprocess.run([node, "-e", check]).returncode, 0)
+
+    def test_camera_without_web_interface(self):
+        wi.prepare_card(self.card, settings(enable_motion=False))
+        result, log = self.run_card()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no web interface found", log)
+        self.assertNotIn("ERROR", log)
+
+    def test_motion_enabled_on_older_firmware_without_prudynt_config(self):
+        (self.bin / "prudynt-config").unlink()
+        (self.root / "etc/prudynt.json").write_text('{"motion": {"enabled": false}}')
+        wi.prepare_card(self.card, settings())
+        result, log = self.run_card()
+        self.assertNotIn("ERROR", log)
+        self.assertIs(json.loads((self.root / "etc/prudynt.json").read_text())["motion"]["enabled"], True)
+
     def test_no_wifi_no_motion_means_no_reboot(self):
         wi.prepare_card(self.card, settings(enable_motion=False))
         result, log = self.run_card()

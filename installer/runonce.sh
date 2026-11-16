@@ -74,6 +74,34 @@ else
 	say "ERROR: could not find where to hook aiwatch in /usr/sbin/motion"
 fi
 
+# --- settings page in the camera's web interface -----------------------------
+WWW="$ROOT/var/www"
+if [ -d "$SRC/www" ] && [ -d "$WWW/a" ] && [ -d "$WWW/x" ]; then
+	mkdir -p "$WWW/a/plugins"
+	if cp "$SRC/www/config-aiwatch.html" "$WWW/config-aiwatch.html" &&
+		cp "$SRC/www/a/config-aiwatch.js" "$WWW/a/config-aiwatch.js" &&
+		cp "$SRC/www/x/json-aiwatch.cgi" "$WWW/x/json-aiwatch.cgi" &&
+		chmod 755 "$WWW/x/json-aiwatch.cgi" &&
+		cp "$SRC/www/a/plugins/aiwatch.webui.json" "$WWW/a/plugins/aiwatch.webui.json"; then
+		# The menu is built from plugins.js. Add this page to it without
+		# touching the entries the firmware put there.
+		if ! grep -q 'plugins.aiwatch' "$WWW/a/plugins.js" 2>/dev/null; then
+			{
+				printf '\n// aiwatch settings page (added by wyzer-cam)\n'
+				printf '(function(){var c=window.thinginoUIConfig=window.thinginoUIConfig||{};'
+				printf 'c.plugins=c.plugins||{};c.plugins.aiwatch='
+				cat "$SRC/www/a/plugins/aiwatch.webui.json"
+				printf ';})();\n'
+			} >>"$WWW/a/plugins.js"
+		fi
+		say "installed the AI Alerts page in the web interface (Services menu)"
+	else
+		say "ERROR: could not install the web interface page"
+	fi
+elif [ -d "$SRC/www" ]; then
+	say "no web interface found on this camera; skipped the settings page"
+fi
+
 # --- notifier settings (Telegram, ntfy) --------------------------------------
 if [ -f "$SRC/send2.json" ]; then
 	if jct "$ROOT/etc/send2.json" import "$SRC/send2.json" >/dev/null 2>&1; then
@@ -85,7 +113,14 @@ fi
 
 # --- motion detection --------------------------------------------------------
 if [ -f "$SRC/enable_motion" ]; then
-	if prudynt-config set motion.enabled true >/dev/null 2>&1; then
+	# Newer thingino has prudynt-config; older builds keep the setting in
+	# /etc/prudynt.json directly.
+	if command -v prudynt-config >/dev/null 2>&1; then
+		prudynt-config set motion.enabled true >/dev/null 2>&1
+	else
+		jct "$ROOT/etc/prudynt.json" set motion.enabled true >/dev/null 2>&1
+	fi
+	if [ $? -eq 0 ]; then
 		say "turned motion detection on"
 		need_reboot=1
 	else

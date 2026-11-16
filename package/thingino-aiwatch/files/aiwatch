@@ -67,6 +67,38 @@ json_str() {
 	clean "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+# Text from the model ends up on notifier command lines, and older thingino
+# send2 scripts run those through "sh -c". Quotes become typographic ones and
+# the other shell metacharacters are dropped, so the text stays inert.
+safe() {
+	clean "$1" | sed -e "s/'/’/g" -e 's/"/”/g' -e 's/[`$\\]//g'
+}
+
+# "HH:MM" as minutes since midnight; empty if it is not a valid time.
+minutes() {
+	case "$1" in
+		[01][0-9]:[0-5][0-9] | 2[0-3]:[0-5][0-9])
+			_h=${1%:*}
+			_m=${1#*:}
+			echo $((${_h#0} * 60 + ${_m#0}))
+			;;
+	esac
+}
+
+# True when no active window is set, or the current time is inside it.
+# A window such as 22:00-06:00 wraps over midnight.
+in_active_hours() {
+	_from=$(minutes "$active_from")
+	_to=$(minutes "$active_to")
+	[ -n "$_from" ] && [ -n "$_to" ] || return 0
+	_now=$(minutes "${AIWATCH_NOW:-$(date +%H:%M)}")
+	if [ "$_from" -le "$_to" ]; then
+		[ "$_now" -ge "$_from" ] && [ "$_now" -lt "$_to" ]
+	else
+		[ "$_now" -ge "$_from" ] || [ "$_now" -lt "$_to" ]
+	fi
+}
+
 # send2ntfy and send2mqtt run the message through date(1) as a format string.
 pct() {
 	printf '%s' "$1" | sed 's/%/%%/g'
@@ -83,6 +115,9 @@ load_config() {
 	camera=$(cfg camera_name)
 	[ -n "$camera" ] || camera=$(hostname 2>/dev/null)
 	context=$(cfg context)
+	extra=$(cfg extra_instructions)
+	active_from=$(cfg active_from)
+	active_to=$(cfg active_to)
 	language=$(cfg language)
 	[ -n "$language" ] || language="English"
 	filter_empty=$(cfg filter_empty)
@@ -183,6 +218,7 @@ build_request() {
 
 	usr="Camera: $(json_str "$camera")\\n"
 	[ -n "$context" ] && usr="${usr}Scene: $(json_str "$context")\\n"
+	[ -n "$extra" ] && usr="${usr}Owner's instructions: $(json_str "$extra")\\n"
 	if [ "$rule_count" -gt 0 ]; then
 		usr="${usr}Alert rules:\\n${rules}Set notify to true only if at least one rule clearly applies to this frame, and set rule to the text of the rule that applies. Otherwise set notify to false and rule to an empty string."
 	elif [ "$filter_empty" = "false" ]; then
@@ -239,14 +275,14 @@ analyze() {
 	# Keep what lies between the first { and the last }: this drops code
 	# fences and any prose the model wrapped around the object.
 	printf '%s' "$content" | tr '\r\n' '  ' | sed -e 's/^[^{]*//' -e 's/[^}]*$//' >"$WORK/answer.json"
-	DESC=$(clean "$(cd "$WORK" && jct ./answer.json get description 2>/dev/null)")
+	DESC=$(safe "$(cd "$WORK" && jct ./answer.json get description 2>/dev/null)")
 	if [ -z "$DESC" ]; then
 		log "could not read a description from the reply: $(clean "$content")"
 		return 1
 	fi
 	NOTIFY=$(cd "$WORK" && jct ./answer.json get notify 2>/dev/null)
 	[ "$NOTIFY" = "true" ] || NOTIFY=false
-	RULE=$(clean "$(cd "$WORK" && jct ./answer.json get rule 2>/dev/null)")
+	RULE=$(safe "$(cd "$WORK" && jct ./answer.json get rule 2>/dev/null)")
 	return 0
 }
 
@@ -301,6 +337,10 @@ cmd_motion() {
 	load_config
 	[ "$enabled" = "true" ] || exit 0
 	require_model
+	in_active_hours || {
+		log "skipped: outside active hours ($active_from-$active_to)"
+		exit 0
+	}
 	acquire_lock || {
 		log "skipped: another run is in progress"
 		exit 0

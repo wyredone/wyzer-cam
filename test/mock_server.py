@@ -17,7 +17,7 @@ ANSWERS = {
     "notify": '{"description": "A courier leaves a parcel at the door.", "notify": true, "rule": "A person is at the door"}',
     "quiet": '{"description": "An empty driveway at dusk.", "notify": false, "rule": ""}',
     "fenced": '```json\n{"description": "A dog runs across the lawn.",\n "notify": true, "rule": ""}\n```',
-    "tricky": '{"description": "Sign says \\"50% off\\" \\\\ sale", "notify": true, "rule": ""}',
+    "tricky": '{"description": "Sign says \\"50% off\\" \\\\ sale it\'s `id` $(id)", "notify": true, "rule": ""}',
     "prose": "I can see a driveway.",
 }
 

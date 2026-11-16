@@ -25,6 +25,19 @@ if command == "import":  # `jct FILE import SOURCE`: deep-merge SOURCE into FILE
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(base, f, indent=2)
     sys.exit(0)
+if command == "set":  # `jct FILE set KEY VALUE` with jct's type guessing for true/false/numbers
+    raw = sys.argv[4]
+    value = {"true": True, "false": False}.get(raw, int(raw) if raw.isdigit() else raw)
+    with open(path, encoding="utf-8") as f:
+        base = json.load(f)
+    node = base
+    parts = key.split(".")
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = value
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(base, f, indent=2)
+    sys.exit(0)
 if command != "get":
     sys.exit(2)
 try:

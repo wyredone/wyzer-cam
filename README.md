@@ -77,6 +77,50 @@ runs `runonce.sh` to apply your settings.
 - **How the files get on the card:** the upstream installer ships as a disk image meant to be written with an imaging tool. The image holds a single FAT32 partition and nothing outside it, so this tool reads the files out of the image and copies them, which needs no admin rights and cannot overwrite the wrong disk. Whether the stock bootloader accepts a card prepared this way has not been confirmed on a camera. If it does not start the install, write the upstream image with an imaging tool, then run this tool on that card without the tick.
 - **One card for both steps is also unconfirmed:** it relies on thingino finding `runonce.sh` on the card on its first boot after the install.
 
+## Settings page in the camera's web interface
+
+Once installed, open the camera's web interface and go to
+**Services &rarr; AI Alerts**. Every aiwatch setting can be changed there:
+
+- **Model:** on/off, endpoint, API key, model.
+- **Scene:** camera name, what the camera sees, language, extra instructions for the model.
+- **Alert rules:** one per line, plus the quiet-when-empty filter.
+- **Send alerts to:** Telegram, ntfy, MQTT, webhook; attach the snapshot; plain alert when the model is unreachable.
+- **Limits:** seconds between calls, calls per day, active hours (may cross midnight), snapshot stream, largest snapshot, timeout.
+
+The top of the page shows whether aiwatch is installed and hooked to motion
+events, whether motion detection is on (with a button to turn it on), and how
+many model calls were used today. **Test now** analyzes a fresh snapshot and
+prints the result; **Test and send** also sends the alert. The last 20 events
+are listed at the bottom.
+
+If the menu entry does not show after installing, reload the page with the
+browser cache bypassed (Ctrl+F5).
+
+To look at the page without a camera:
+
+```bash
+python test/preview_server.py
+```
+
+## Install over the network
+
+For a camera that already runs thingino and is reachable by SSH, the card is
+not needed. Run the installer, press **Browse** and pick an empty folder
+instead of a card (here `stage`), then **Write to SD card**. Then, replacing
+`CAM` with the camera's address:
+
+```bash
+scp -O -r stage root@CAM:/tmp/wyzer-card
+```
+
+```bash
+ssh root@CAM "sh /tmp/wyzer-card/runonce.sh; cat /tmp/wyzer-card/wyzer/install.log"
+```
+
+The camera restarts if Wi-Fi or motion detection was changed. Delete the
+`stage` folder afterwards; it holds your API key.
+
 ## Install by hand on a camera already running thingino
 
 No rebuild needed. Replace `CAM` with the camera's address.
@@ -143,6 +187,8 @@ thingino; pick the config that matches your unit's SoC and Wi-Fi chip.
 | `camera_name` | hostname | Given to the model and included in MQTT/webhook payloads. |
 | `context` | empty | One line about the scene, such as "Front porch facing the street". |
 | `language` | `English` | Language of the description. |
+| `extra_instructions` | empty | One line of extra guidance for the model, such as "The grey cat lives here; do not report it". |
+| `active_from`, `active_to` | empty | Only analyze events between these times (`HH:MM`). Empty means all day. May cross midnight. |
 | `rules` | `[]` | Up to 10 plain-language alert rules. |
 | `filter_empty` | `true` | With no rules: stay quiet when nothing notable is visible. `false` alerts on every event. |
 | `services` | `["telegram"]` | Any of `telegram`, `ntfy`, `mqtt`, `webhook`. Each must be set up in `/etc/send2.json`. |
@@ -169,6 +215,8 @@ MQTT and webhook receive a JSON payload:
 
 ## Things to know
 
+- **Older thingino builds:** aiwatch was written against the current stable branch. On builds from mid-2026 the settings page, Telegram, MQTT and webhook alerts are expected to work, but ntfy needs the server set as a full `https://` address under Send to services. Updating thingino first avoids this; a full update erases aiwatch, so install it again afterwards.
+- **Model text is made inert:** quotes in descriptions become typographic quotes and `` ` ``, `$` and `\` are removed before the text reaches a notifier, because older notifier scripts pass it through a shell.
 - **Duplicate alerts:** if thingino's own motion notifications are also on for the same service, you get two messages per event. Turn the plain one off.
 - **Key storage:** the camera's flash is not encrypted. Use a dedicated API key with a spending limit.
 - **Counters reset on reboot:** the daily count and event log live in `/tmp/aiwatch`, which is RAM.

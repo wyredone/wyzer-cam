@@ -1,0 +1,32 @@
+{
+  "name": "aiwatch",
+  "label": "AI Alerts",
+  "apiVersion": 1,
+  "nav": [
+    {
+      "section": "ddServices",
+      "position": "append",
+      "items": [
+        {
+          "label": "AI Alerts",
+          "href": "/config-aiwatch.html"
+        }
+      ]
+    }
+  ],
+  "scripts": [],
+  "styles": [],
+  "preview": {
+    "scripts": [],
+    "html": null
+  },
+  "featureFlags": {
+    "aiwatch": true
+  },
+  "cgi": [
+    "/x/json-aiwatch.cgi"
+  ],
+  "pages": [
+    "/config-aiwatch.html"
+  ]
+}

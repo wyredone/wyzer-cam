@@ -133,9 +133,16 @@ check "fenced reply parsed" "$(sent)" "[A dog runs across the lawn.]"
 SERVICES='["ntfy","mqtt","webhook","bogus"]' config; reset tricky
 run motion
 OUT=$(sent)
-check "tricky: ntfy percent escaped" "$OUT" 'send2ntfy [-S] [-m] [Sign says "50%% off" \ sale]'
-check "tricky: webhook payload" "$OUT" 'send2webhook [-S] [-m] [{"event":"motion","camera":"porch","description":"Sign says \"50% off\" \\ sale"'
-check "tricky: mqtt payload" "$OUT" 'send2mqtt [-m] [{"event":"motion","camera":"porch","description":"Sign says \"50%% off\" \\ sale"'
+check "tricky: ntfy percent escaped, shell characters neutralised" "$OUT" 'send2ntfy [-S] [-m] [Sign says ”50%% off”  sale it’s id (id)]'
+check "tricky: webhook payload" "$OUT" 'send2webhook [-S] [-m] [{"event":"motion","camera":"porch","description":"Sign says ”50% off”  sale it’s id (id)"'
+check "tricky: mqtt payload" "$OUT" 'send2mqtt [-m] [{"event":"motion","camera":"porch","description":"Sign says ”50%% off”  sale it’s id (id)"'
+case "$OUT" in
+	*"'"* | *'`'* | *'$('*)
+		FAIL=$((FAIL + 1))
+		echo "FAIL: tricky: shell metacharacters reached a notifier"
+		;;
+	*) PASS=$((PASS + 1)) ;;
+esac
 check "tricky: unsupported service logged" "$(cat "$T/log")" "service 'bogus' is not supported"
 python -I -c "
 import json,sys
@@ -160,6 +167,22 @@ COOLDOWN=600 config; reset notify
 run motion
 run motion
 check "cooldown: second event skipped" "$(hits)" "1"
+
+config; reset notify
+python -I -c "
+import json, sys
+c = json.load(open(sys.argv[1], encoding='utf-8'))
+c.update(active_from='22:00', active_to='06:00', extra_instructions='Ignore the cat next door')
+json.dump(c, open(sys.argv[1], 'w', encoding='utf-8'))
+" "$T/aiwatch.json"
+AIWATCH_NOW=12:30 run motion
+check "active hours: midday skipped" "$(hits)" "0"
+check "active hours: logged" "$(cat "$T/log")" "outside active hours (22:00-06:00)"
+AIWATCH_NOW=23:15 run motion
+check "active hours: late evening runs" "$(hits)" "1"
+check "extra instructions sent" "$(python -I -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['messages'][1]['content'][0]['text'])" "$SRV/request.json")" "Owner's instructions: Ignore the cat next door"
+AIWATCH_NOW=05:59 run motion
+check "active hours: early morning runs" "$(hits)" "2"
 
 LIMIT=2 config; reset notify
 run motion; run motion; run motion

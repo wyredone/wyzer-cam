@@ -44,6 +44,14 @@ FLASH_SPACE_BYTES = 64 * 1024 * 1024
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AIWATCH_SRC = REPO_ROOT / "package" / "thingino-aiwatch" / "files" / "aiwatch"
 RUNONCE_SRC = Path(__file__).resolve().parent / "runonce.sh"
+# The settings page: (path in the package, path under wyzer/ on the card).
+WEBUI_SRC = REPO_ROOT / "package" / "thingino-aiwatch" / "files"
+WEBUI_FILES = (
+    ("www/config-aiwatch.html", "www/config-aiwatch.html"),
+    ("www/a/config-aiwatch.js", "www/a/config-aiwatch.js"),
+    ("www/x/json-aiwatch.cgi", "www/x/json-aiwatch.cgi"),
+    ("aiwatch.webui.json", "www/a/plugins/aiwatch.webui.json"),
+)
 RUNONCE_MARKER = b"wyzer-cam-runonce"
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 THINGINO_INSTALL_URL = "https://github.com/wltechblog/thingino-installers/tree/main/wyze-cam-3"
@@ -325,6 +333,12 @@ def prepare_card(target, settings):
     _write(target / "runonce.sh", _unix_script(RUNONCE_SRC))
     _write(data_dir / "aiwatch", _unix_script(AIWATCH_SRC))
     done.append("Copied runonce.sh and the aiwatch script")
+
+    if all((WEBUI_SRC / src).is_file() for src, _ in WEBUI_FILES):
+        for src, dest in WEBUI_FILES:
+            (data_dir / dest).parent.mkdir(parents=True, exist_ok=True)
+            _write(data_dir / dest, _unix_script(WEBUI_SRC / src))
+        done.append("Copied the AI Alerts page for the camera's web interface")
 
     _write(data_dir / "aiwatch.json", json.dumps(build_aiwatch_config(settings), indent=2) + "\n")
     done.append("Wrote AI settings (%d rule%s)" % (len(settings["rules"]), "" if len(settings["rules"]) == 1 else "s"))

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>thingino · AI Alerts</title>
+  <script src="/a/theme-init.js"></script>
+  <link rel="icon" type="image/svg+xml" href="/a/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&amp;display=swap">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css"
+    integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous"
+    onerror="this.onerror=null;this.removeAttribute('integrity');this.href='/a/vendor/bootstrap.min.css'">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.min.css"
+    onerror="this.onerror=null;this.href='/a/vendor/bootstrap-icons.min.css'">
+  <link rel="stylesheet" href="/a/main.css">
+</head>
+
+<body id="page-service-aiwatch">
+<nav data-app-nav></nav>
+
+<main class="pb-4">
+  <div class="container" style="min-height:80vh">
+    <div data-app-controls></div>
+
+    <section>
+      <div class="card mb-3">
+        <div class="card-header">
+          <h2 class="card-title">AI Alerts</h2>
+          <small>Describe motion events with a vision model and alert by plain-language rules</small>
+        </div>
+        <div class="card-body">
+          <div class="row g-3 align-items-center">
+            <div class="col-12 col-lg-7">
+              <ul class="list-unstyled mb-0" id="aiwatch-status">
+                <li>Loading status&hellip;</li>
+              </ul>
+            </div>
+            <div class="col-12 col-lg-5 text-lg-end">
+              <button type="button" class="btn btn-outline-secondary" id="aiwatch-test">
+                <i class="bi bi-camera"></i> Test now
+              </button>
+              <button type="button" class="btn btn-outline-secondary ms-1" id="aiwatch-test-notify"
+                title="Analyze a snapshot and send the alert through the selected services">
+                <i class="bi bi-send"></i> Test and send
+              </button>
+            </div>
+          </div>
+          <pre class="mt-3 mb-0 d-none" id="aiwatch-test-output" style="white-space:pre-wrap"></pre>
+        </div>
+      </div>
+
+      <form id="aiwatchForm" autocomplete="off" novalidate>
+        <div class="card mb-3">
+          <div class="card-body">
+            <div class="row g-4">
+              <div class="col-12 col-lg-6">
+                <h4>Model</h4>
+                <p class="form-switch">
+                  <input type="checkbox" class="form-check-input" id="enabled">
+                  <label class="form-check-label" for="enabled">Analyze motion events</label>
+                  <br><span class="hint text-secondary">Sends one snapshot per event to the endpoint below.</span>
+                </p>
+                <p>
+                  <label for="endpoint">Endpoint</label>
+                  <input type="url" id="endpoint" class="form-control" placeholder="https://openrouter.ai/api/v1/chat/completions">
+                  <span class="hint text-secondary">Any OpenAI-compatible chat completions URL, including one on your network.</span>
+                </p>
+                <p>
+                  <label for="api_key">API key</label>
+                  <span class="input-group">
+                    <input type="password" id="api_key" class="form-control" autocomplete="new-password">
+                    <button type="button" class="btn btn-outline-secondary" id="api_key_toggle">Show</button>
+                  </span>
+                  <span class="hint text-secondary">Use a key with a spending limit; the camera stores it unencrypted.</span>
+                </p>
+                <p>
+                  <label for="model">Model</label>
+                  <input type="text" id="model" class="form-control" placeholder="google/gemini-2.5-flash-lite">
+                  <span class="hint text-secondary">Must accept images.</span>
+                </p>
+
+                <h4 class="mt-4">Scene</h4>
+                <p>
+                  <label for="camera_name">Camera name</label>
+                  <input type="text" id="camera_name" class="form-control" placeholder="Uses the hostname when empty">
+                </p>
+                <p>
+                  <label for="context">What the camera sees</label>
+                  <input type="text" id="context" class="form-control" placeholder="Front porch facing the street">
+                </p>
+                <p>
+                  <label for="language">Language of descriptions</label>
+                  <input type="text" id="language" class="form-control" placeholder="English">
+                </p>
+                <p>
+                  <label for="extra_instructions">Extra instructions</label>
+                  <textarea id="extra_instructions" class="form-control" rows="2" maxlength="400"
+                    placeholder="The grey cat lives here; do not report it"></textarea>
+                </p>
+              </div>
+
+              <div class="col-12 col-lg-6">
+                <h4>Alert rules</h4>
+                <p>
+                  <label for="rules">Alert only when</label>
+                  <textarea id="rules" class="form-control" rows="5"
+                    placeholder="A person is at the door&#10;A vehicle is parked in the driveway"></textarea>
+                  <span class="hint text-secondary">One rule per line, up to 10. An event alerts when any rule applies.</span>
+                </p>
+                <p class="form-switch">
+                  <input type="checkbox" class="form-check-input" id="filter_empty">
+                  <label class="form-check-label" for="filter_empty">With no rules, stay quiet when nothing notable is visible</label>
+                </p>
+
+                <h4 class="mt-4">Send alerts to</h4>
+                <p>
+                  <span class="form-check form-check-inline">
+                    <input type="checkbox" class="form-check-input aiwatch-service" id="svc_telegram" value="telegram">
+                    <label class="form-check-label" for="svc_telegram">Telegram</label>
+                  </span>
+                  <span class="form-check form-check-inline">
+                    <input type="checkbox" class="form-check-input aiwatch-service" id="svc_ntfy" value="ntfy">
+                    <label class="form-check-label" for="svc_ntfy">ntfy</label>
+                  </span>
+                  <span class="form-check form-check-inline">
+                    <input type="checkbox" class="form-check-input aiwatch-service" id="svc_mqtt" value="mqtt">
+                    <label class="form-check-label" for="svc_mqtt">MQTT</label>
+                  </span>
+                  <span class="form-check form-check-inline">
+                    <input type="checkbox" class="form-check-input aiwatch-service" id="svc_webhook" value="webhook">
+                    <label class="form-check-label" for="svc_webhook">Webhook</label>
+                  </span>
+                  <br><span class="hint text-secondary">Each service is set up under
+                    <a href="/tool-send2.html">Tools &rarr; Send to services</a>.</span>
+                </p>
+                <p class="form-switch">
+                  <input type="checkbox" class="form-check-input" id="send_photo">
+                  <label class="form-check-label" for="send_photo">Attach the snapshot</label>
+                </p>
+                <p class="form-switch">
+                  <input type="checkbox" class="form-check-input" id="fallback_on_error">
+                  <label class="form-check-label" for="fallback_on_error">Send a plain alert when the model cannot be reached</label>
+                </p>
+
+                <h4 class="mt-4">Limits</h4>
+                <div class="row g-2">
+                  <p class="col-6">
+                    <label for="cooldown">Seconds between calls</label>
+                    <input type="number" id="cooldown" class="form-control" min="0" max="86400">
+                  </p>
+                  <p class="col-6">
+                    <label for="daily_limit">Calls per day</label>
+                    <input type="number" id="daily_limit" class="form-control" min="0" max="100000">
+                  </p>
+                  <p class="col-6">
+                    <label for="active_from">Active from</label>
+                    <input type="time" id="active_from" class="form-control">
+                  </p>
+                  <p class="col-6">
+                    <label for="active_to">Active until</label>
+                    <input type="time" id="active_to" class="form-control">
+                  </p>
+                  <p class="col-12 mt-0">
+                    <span class="hint text-secondary">Leave both times empty to stay active all day. A window may cross midnight.</span>
+                  </p>
+                  <p class="col-4">
+                    <label for="snapshot_channel">Snapshot from</label>
+                    <select id="snapshot_channel" class="form-select">
+                      <option value="1">Substream</option>
+                      <option value="0">Main stream</option>
+                    </select>
+                  </p>
+                  <p class="col-4">
+                    <label for="max_image_kb">Largest snapshot, KB</label>
+                    <input type="number" id="max_image_kb" class="form-control" min="50" max="4000">
+                  </p>
+                  <p class="col-4">
+                    <label for="timeout">Timeout, seconds</label>
+                    <input type="number" id="timeout" class="form-control" min="5" max="120">
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary" id="aiwatch-save">Save changes</button>
+        <button type="button" class="btn btn-outline-secondary ms-2" id="aiwatch-reload">
+          <i class="bi bi-arrow-clockwise"></i> Reload
+        </button>
+      </form>
+
+      <div class="card mt-4">
+        <div class="card-header">
+          <h4 class="card-title mb-0">Recent events</h4>
+          <small>Kept in memory; cleared when the camera restarts</small>
+        </div>
+        <div class="card-body">
+          <table class="table table-sm table-striped mb-0">
+            <thead>
+              <tr><th>Time</th><th>Alert</th><th>Description</th><th>Rule</th></tr>
+            </thead>
+            <tbody id="aiwatch-events"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer data-app-footer></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"
+  integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"
+  onerror="this.onerror=null;var s=document.createElement('script');s.src='/a/vendor/bootstrap.bundle.min.js';document.head.appendChild(s)"></script>
+<script src="/a/main.js"></script>
+<script src="/a/runtime-config.js"></script>
+<script src="/a/plugins.js"></script>
+<script src="/a/control-bar.js"></script>
+<script src="/a/navigation.js"></script>
+<script src="/a/footer.js"></script>
+<script src="/a/config-aiwatch.js"></script>
+</body>
+</html>
