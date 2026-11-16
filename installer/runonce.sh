@@ -16,6 +16,8 @@ LOG="$SRC/install.log"
 ROOT="${WYZER_ROOT:-}"
 MOTION="$ROOT/usr/sbin/motion"
 need_reboot=0
+# Set WYZER_NO_REBOOT=1 (the SSH installer does) to be told instead of restarted.
+NO_REBOOT="${WYZER_NO_REBOOT:-}"
 
 say() {
 	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG" 2>/dev/null
@@ -40,8 +42,19 @@ else
 fi
 
 if [ -f "$SRC/aiwatch.json" ]; then
+	# Updating: a blank API key in the new settings means "keep the one I have".
+	old_key=""
+	[ -f "$ROOT/etc/aiwatch.json" ] && old_key=$(jct "$ROOT/etc/aiwatch.json" get api_key 2>/dev/null)
+	new_key=$(jct "$SRC/aiwatch.json" get api_key 2>/dev/null)
 	if cp "$SRC/aiwatch.json" "$ROOT/etc/aiwatch.json" && chmod 600 "$ROOT/etc/aiwatch.json"; then
 		say "installed /etc/aiwatch.json"
+		if [ -z "$new_key" ] && [ -n "$old_key" ]; then
+			if jct "$ROOT/etc/aiwatch.json" set api_key "$old_key" >/dev/null 2>&1; then
+				say "kept the API key already on the camera"
+			else
+				say "ERROR: could not keep the API key already on the camera"
+			fi
+		fi
 	else
 		say "ERROR: could not install /etc/aiwatch.json"
 	fi
@@ -84,16 +97,22 @@ if [ -d "$SRC/www" ] && [ -d "$WWW/a" ] && [ -d "$WWW/x" ]; then
 		chmod 755 "$WWW/x/json-aiwatch.cgi" &&
 		cp "$SRC/www/a/plugins/aiwatch.webui.json" "$WWW/a/plugins/aiwatch.webui.json"; then
 		# The menu is built from plugins.js. Add this page to it without
-		# touching the entries the firmware put there.
-		if ! grep -q 'plugins.aiwatch' "$WWW/a/plugins.js" 2>/dev/null; then
-			{
-				printf '\n// aiwatch settings page (added by wyzer-cam)\n'
-				printf '(function(){var c=window.thinginoUIConfig=window.thinginoUIConfig||{};'
-				printf 'c.plugins=c.plugins||{};c.plugins.aiwatch='
-				cat "$SRC/www/a/plugins/aiwatch.webui.json"
-				printf ';})();\n'
-			} >>"$WWW/a/plugins.js"
+		# touching the entries the firmware put there. An earlier copy of our
+		# block is removed first, so an update refreshes it instead of doubling it.
+		if [ -f "$WWW/a/plugins.js" ]; then
+			awk '
+				/^\/\/ aiwatch settings page \(added by wyzer-cam\)$/ { skip = 1; next }
+				skip { if (index($0, ";})();")) skip = 0; next }
+				{ print }' "$WWW/a/plugins.js" >"$WWW/a/plugins.js.new" && cat "$WWW/a/plugins.js.new" >"$WWW/a/plugins.js"
+			rm -f "$WWW/a/plugins.js.new"
 		fi
+		{
+			printf '// aiwatch settings page (added by wyzer-cam)\n'
+			printf '(function(){var c=window.thinginoUIConfig=window.thinginoUIConfig||{};'
+			printf 'c.plugins=c.plugins||{};c.plugins.aiwatch='
+			cat "$SRC/www/a/plugins/aiwatch.webui.json"
+			printf ';})();\n'
+		} >>"$WWW/a/plugins.js"
 		say "installed the AI Alerts page in the web interface (Services menu)"
 	else
 		say "ERROR: could not install the web interface page"
@@ -122,7 +141,9 @@ if [ -f "$SRC/enable_motion" ]; then
 	fi
 	if [ $? -eq 0 ]; then
 		say "turned motion detection on"
-		need_reboot=1
+		# Apply it to the running streamer too; if that is not possible the
+		# setting takes effect after a restart.
+		echo '{"motion":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1 || need_reboot=1
 	else
 		say "ERROR: could not turn motion detection on"
 	fi
@@ -145,11 +166,15 @@ rm -f "$SRC/aiwatch.json" "$SRC/send2.json" "$SRC/wifi_ssid" "$SRC/wifi_pass" "$
 say "removed keys and passwords from the card"
 say "setup finished"
 
-# Reboot only if the done-flag can be written: on a write-protected card the
-# script would otherwise run again on every boot and reboot forever.
-if [ "$need_reboot" = 1 ] && touch "$CARD/runonce.done" 2>/dev/null; then
-	say "rebooting to apply settings"
-	sync
-	reboot
+if [ "$need_reboot" = 1 ]; then
+	if [ -n "$NO_REBOOT" ]; then
+		say "restart needed to apply the Wi-Fi settings"
+	elif touch "$CARD/runonce.done" 2>/dev/null; then
+		# Only if the done-flag can be written: on a write-protected card the
+		# script would otherwise run again on every boot and reboot forever.
+		say "rebooting to apply settings"
+		sync
+		reboot
+	fi
 fi
 exit 0

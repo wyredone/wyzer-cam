@@ -67,7 +67,7 @@ class BackendTests(unittest.TestCase):
         status, data, _ = self.cam.request("action=status")
         self.assertEqual(status, 200)
         self.assertEqual(data, {"ok": True, "installed": True, "hooked": True, "motion_enabled": False,
-                                "calls_today": 0, "events": []})
+                                "calls_today": 0, "usage": [], "events": []})
 
         (self.cam.state / "count").write_bytes((time.strftime("%Y%m%d") + " 7\n").encode())
         events = [{"time": "2026-11-15T20:30:00-0600", "status": "ok", "notify": True,
@@ -81,6 +81,21 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(data["calls_today"], 7)
         self.assertEqual(data["events"], events)
         self.assertIs(data["hooked"], False)
+
+    def test_status_reports_model_usage(self):
+        today = time.strftime("%Y%m%d")
+        hold = int(time.time()) + 120
+        lines = ["%s free/a:free 3 2 %d" % (today, hold),
+                 "%s free/b:free 5 0 0" % today,
+                 "20200101 free/old:free 9 9 0",       # an earlier day
+                 "%s bad;model 1 1 0" % today,         # not a model id
+                 "%s short line" % today]
+        (self.cam.state / "usage").write_bytes(("\n".join(lines) + "\n").encode())
+        usage = self.cam.request("action=status")[1]["usage"]
+        self.assertEqual([u["model"] for u in usage], ["free/a:free", "free/b:free"])
+        self.assertEqual((usage[0]["calls"], usage[0]["failures"]), (3, 2))
+        self.assertTrue(100 <= usage[0]["wait"] <= 120, usage[0])
+        self.assertEqual(usage[1], {"model": "free/b:free", "calls": 5, "failures": 0, "wait": 0})
 
     def test_status_ignores_yesterdays_count(self):
         (self.cam.state / "count").write_bytes(b"20200101 99\n")
@@ -127,7 +142,7 @@ class FileTests(unittest.TestCase):
         self.assertEqual(used - ids, set())
         # Every setting aiwatch reads can be edited on the page.
         defaults = json.loads((FILES / "aiwatch.json").read_text(encoding="utf-8"))
-        editable = ids | {"services"}
+        editable = ids | {"services", "free_pool", "free_models"}  # radios and a generated checkbox list
         self.assertEqual(set(defaults) - editable, set())
 
     def test_shell_files_have_unix_line_endings(self):

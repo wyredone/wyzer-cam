@@ -15,7 +15,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "installer"))
-import wyzer_installer as wi  # noqa: E402
+import wyzer_core as wi  # noqa: E402
 
 SH = shutil.which("sh")
 
@@ -92,6 +92,67 @@ class CoreTests(unittest.TestCase):
         wi.prepare_card(self.tmp, settings(enable_motion=False))
         for name in ("wifi_ssid", "wifi_pass", "send2.json", "enable_motion"):
             self.assertFalse((self.tmp / "wyzer" / name).exists(), name)
+
+    def test_pool_settings_are_checked_and_written(self):
+        bad = settings(free_pool=True, free_models=[])
+        self.assertIn("Pick at least one free model", " ".join(wi.check_settings(bad)[0]))
+        bad = settings(free_pool=True, free_models=["ok/model:free", "bad id;rm"])
+        self.assertIn("characters a model id does not use", " ".join(wi.check_settings(bad)[0]))
+        bad = settings(free_pool=True, free_models=["m/%d:free" % i for i in range(11)])
+        self.assertIn("At most 10", " ".join(wi.check_settings(bad)[0]))
+        good = settings(free_pool=True, free_models=["google/gemma-4-31b-it:free", "nvidia/x:free"],
+                        free_daily_limit="40", max_attempts="2", active_from="22:00", active_to="06:00",
+                        extra_instructions="  ignore\nthe cat  ")
+        errors, warnings = wi.check_settings(good)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("keep or train" in w for w in warnings))
+        config = wi.build_aiwatch_config(good)
+        self.assertIs(config["free_pool"], True)
+        self.assertEqual(config["free_models"], ["google/gemma-4-31b-it:free", "nvidia/x:free"])
+        self.assertEqual((config["free_daily_limit"], config["max_attempts"]), (40, 2))
+        self.assertEqual(config["extra_instructions"], "ignore the cat")
+        self.assertEqual(wi.build_aiwatch_config(settings(model=""))["model"], "google/gemini-2.5-flash-lite")
+
+    def test_recommended_model_is_the_default(self):
+        self.assertEqual(wi.DEFAULTS["model"], "google/gemini-2.5-flash-lite")
+        self.assertEqual(json.loads((wi.WEBUI_SRC / "aiwatch.json").read_text())["model"],
+                         "google/gemini-2.5-flash-lite")
+
+    def test_active_times_must_pair_and_parse(self):
+        self.assertIn("both active times", " ".join(wi.check_settings(settings(active_from="22:00"))[0]))
+        self.assertIn("look like 22:00", " ".join(wi.check_settings(settings(active_from="25:00", active_to="06:00"))[0]))
+        self.assertEqual(wi.check_settings(settings(active_from="22:00", active_to="06:00"))[0], [])
+
+    def test_profile_never_stores_secrets(self):
+        import os
+        os.environ["WYZER_HOME"] = str(self.tmp / "home")
+        self.addCleanup(os.environ.pop, "WYZER_HOME", None)
+        secret = settings(api_key="SECRET-KEY", tg_token="123456789:SECRET-TOKEN-VALUE", ntfy_topic="secret-topic",
+                          wifi_pass="secret-wifi-pw", wifi_ssid="HomeNet", tg_channel="-1001", rules=["A person"])
+        wi.save_profile(secret, "192.168.1.185", "root")
+        text = (self.tmp / "home" / "profile.json").read_text(encoding="utf-8")
+        for value in ("SECRET-KEY", "SECRET-TOKEN-VALUE", "secret-topic", "secret-wifi-pw"):
+            self.assertNotIn(value, text)
+        profile = wi.load_profile()
+        self.assertEqual(profile["camera_host"], "192.168.1.185")
+        restored = wi.apply_profile(dict(wi.DEFAULTS), profile)
+        self.assertEqual((restored["wifi_ssid"], restored["tg_channel"], restored["rules"]),
+                         ("HomeNet", "-1001", ["A person"]))
+        self.assertEqual((restored["api_key"], restored["tg_token"], restored["wifi_pass"]), ("", "", ""))
+
+    def test_profile_survives_garbage(self):
+        import os
+        os.environ["WYZER_HOME"] = str(self.tmp / "home")
+        self.addCleanup(os.environ.pop, "WYZER_HOME", None)
+        self.assertEqual(wi.load_profile(), {})
+        (self.tmp / "home").mkdir()
+        (self.tmp / "home" / "profile.json").write_text("{not json")
+        self.assertEqual(wi.load_profile(), {})
+        (self.tmp / "home" / "profile.json").write_text('{"rules": "not a list", "model": 5, "api_key": "x"}')
+        restored = wi.apply_profile(dict(wi.DEFAULTS), wi.load_profile())
+        self.assertEqual(restored["rules"], [])
+        self.assertEqual(restored["model"], "google/gemini-2.5-flash-lite")
+        self.assertEqual(restored["api_key"], "")
 
     def test_foreign_runonce_detected(self):
         self.assertFalse(wi.foreign_runonce(self.tmp))
@@ -243,13 +304,38 @@ class FlashTests(unittest.TestCase):
     def test_validate_flash_checks_space(self):
         real = wi.card_info
         self.addCleanup(setattr, wi, "card_info", real)
-        wi.card_info = lambda path: ("exFAT", 10 * 1024 * 1024)
-        errors, _ = wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp, flash=True)
+        good = settings(tg_token="t", tg_channel="1")
+        wi.card_info = lambda path: ("exFAT", 10 * 1024 * 1024, 16 * 10 ** 9)
+        errors, _ = wi.validate(good, self.tmp, flash=True)
         self.assertEqual(len(errors), 2)
         self.assertIn("FAT32", errors[0])
-        wi.card_info = lambda path: ("FAT32", 10 ** 9)
-        self.assertEqual(wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp, flash=True)[0], [])
-        self.assertEqual(wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp)[0], [])
+        wi.card_info = lambda path: ("FAT32", 10 ** 9, 16 * 10 ** 9)
+        self.assertEqual(wi.validate(good, self.tmp, flash=True), ([], []))
+        self.assertEqual(wi.validate(good, self.tmp), ([], []))
+
+    def test_large_fat32_card_is_accepted_with_a_warning(self):
+        real = wi.card_info
+        self.addCleanup(setattr, wi, "card_info", real)
+        good = settings(tg_token="t", tg_channel="1")
+        wi.card_info = lambda path: ("FAT32", 120 * 10 ** 9, 128 * 10 ** 9)  # a 128 GB card formatted FAT32
+        errors, warnings = wi.validate(good, self.tmp, flash=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("128 GB", warnings[0])
+        self.assertIn("32 GB or less", warnings[0])
+        # Files really are written to such a card: nothing in the setup depends on its size.
+        wi.prepare_card(self.tmp, good)
+        self.assertTrue((self.tmp / "runonce.sh").exists())
+        # Without the thingino install the size is not an issue at all.
+        self.assertEqual(wi.validate(good, self.tmp), ([], []))
+
+    def test_large_exfat_card_explains_how_to_get_fat32(self):
+        real = wi.card_info
+        self.addCleanup(setattr, wi, "card_info", real)
+        wi.card_info = lambda path: ("exFAT", 120 * 10 ** 9, 128 * 10 ** 9)
+        errors, _ = wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp, flash=True)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("guiformat", errors[0])
 
 
 @unittest.skipUnless(SH, "sh not found")

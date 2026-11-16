@@ -11,12 +11,15 @@
 #   aiwatch test [-n] [image]   analyze a fresh snapshot or a JPEG file and print
 #                               the result; -n also sends the notifications
 #   aiwatch status              show settings, today's call count, recent events
+#   aiwatch usage [json]        per-model calls and failures for today
 
 CONFIG="${AIWATCH_CONFIG:-/etc/aiwatch.json}"
 STATE_DIR="${AIWATCH_STATE_DIR:-/tmp/aiwatch}"
 LOCK="$STATE_DIR/lock"
 EVENTS="$STATE_DIR/events.jsonl"
 EVENTS_KEEP=200
+USAGE="$STATE_DIR/usage"
+RR="$STATE_DIR/rr"
 DEFAULT_ENDPOINT="https://openrouter.ai/api/v1/chat/completions"
 
 WORK=""
@@ -24,6 +27,8 @@ HAVE_LOCK=""
 DESC=""
 NOTIFY=""
 RULE=""
+USED_MODEL=""
+FORCE=""
 
 log() {
 	logger -t aiwatch "$*" 2>/dev/null
@@ -112,6 +117,21 @@ load_config() {
 	[ -n "$endpoint" ] || endpoint=$DEFAULT_ENDPOINT
 	api_key=$(cfg api_key)
 	model=$(cfg model)
+	use_pool=$(cfg free_pool)
+	free_limit=$(num "$(cfg free_daily_limit)" 45)
+	max_attempts=$(num "$(cfg max_attempts)" 3)
+	pool=""
+	pool_n=0
+	pool_i=0
+	while [ "$pool_i" -lt 10 ]; do
+		pool_m=$(cfg "free_models.$pool_i") || break
+		[ -n "$pool_m" ] || break
+		pool_i=$((pool_i + 1))
+		valid_model "$pool_m" || continue
+		case " $pool " in *" $pool_m "*) continue ;; esac
+		pool="$pool $pool_m"
+		pool_n=$((pool_n + 1))
+	done
 	camera=$(cfg camera_name)
 	[ -n "$camera" ] || camera=$(hostname 2>/dev/null)
 	context=$(cfg context)
@@ -139,8 +159,18 @@ load_config() {
 	done
 }
 
+# A model id may only hold characters that appear in real ones.
+valid_model() {
+	case "$1" in
+		'' | *[!A-Za-z0-9._:/-]*) return 1 ;;
+	esac
+	return 0
+}
+
 require_model() {
+	[ "$use_pool" = "true" ] && [ -n "$pool" ] && return 0
 	[ -n "$model" ] || die "no model set; put a vision-capable model id in $CONFIG (key: model)"
+	valid_model "$model" || die "invalid model id '$model' in $CONFIG"
 }
 
 make_workdir() {
@@ -228,7 +258,7 @@ build_request() {
 	fi
 
 	{
-		printf '{"model":"%s","max_tokens":200,"temperature":0.2,"messages":[' "$(json_str "$model")"
+		printf '{"model":"%s","max_tokens":200,"temperature":0.2,"messages":[' "$(json_str "$1")"
 		printf '{"role":"system","content":"%s"},' "$sys"
 		printf '{"role":"user","content":[{"type":"text","text":"%s"},' "$usr"
 		printf '{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,'
@@ -237,12 +267,95 @@ build_request() {
 	} >"$WORK/req.json"
 }
 
-# Calls the endpoint for $WORK/snap.jpg. On success sets DESC, NOTIFY, RULE.
-analyze() {
+# --- usage tracking and model rotation -----------------------------------------
+# $USAGE holds one line per model and day:  DAY MODEL CALLS FAILURES HOLD_UNTIL
+# where HOLD_UNTIL is the time (epoch seconds) before which a model that just
+# failed is left alone. Lines from earlier days are dropped on each update.
+
+usage_note() {
+	# $1 model, $2 1 if the call failed, $3 seconds to leave the model alone (0 clears)
+	mkdir -p "$STATE_DIR"
+	[ -f "$USAGE" ] || : >"$USAGE"
+	awk -v day="$(date +%Y%m%d)" -v m="$1" -v f="$2" -v hold="$3" -v until="$(($(date +%s) + $3))" '
+		$1 == day && $2 == m { $3++; $4 += f; $5 = (hold > 0 ? until : 0); found = 1 }
+		$1 == day { print }
+		END { if (!found) print day, m, 1, f, (hold > 0 ? until : 0) }
+	' "$USAGE" >"$USAGE.tmp" && mv "$USAGE.tmp" "$USAGE"
+}
+
+usage_get() {
+	# $1 model, $2 column (3 calls, 4 failures, 5 hold-until); empty if none today
+	awk -v day="$(date +%Y%m%d)" -v m="$1" -v c="$2" '$1 == day && $2 == m { print $c; exit }' "$USAGE" 2>/dev/null
+}
+
+pool_calls() {
+	_total=0
+	for _m in $pool; do
+		_total=$((_total + $(num "$(usage_get "$_m" 3)" 0)))
+	done
+	echo "$_total"
+}
+
+# Fills CANDIDATES with the models to try, in order, and MAX_TRIES. Returns 1
+# when there is nothing to try right now.
+choose_models() {
+	CANDIDATES=""
+	if [ "$use_pool" != "true" ] || [ -z "$pool" ]; then
+		CANDIDATES="$model"
+		MAX_TRIES=1
+		return 0
+	fi
+	MAX_TRIES=$max_attempts
+	[ "$MAX_TRIES" -ge 1 ] || MAX_TRIES=1
+	if [ -z "$FORCE" ] && [ "$(pool_calls)" -ge "$free_limit" ]; then
+		log "skipped: free model limit of $free_limit calls a day reached"
+		return 1
+	fi
+
+	_start=$(num "$(cat "$RR" 2>/dev/null)" 0)
+	[ "$_start" -lt "$pool_n" ] || _start=0
+	_now=$(date +%s)
+	_i=0
+	while [ "$_i" -lt "$pool_n" ]; do
+		_want=$(((_start + _i) % pool_n))
+		_k=0
+		for _m in $pool; do
+			[ "$_k" -eq "$_want" ] && break
+			_k=$((_k + 1))
+		done
+		_until=$(num "$(usage_get "$_m" 5)" 0)
+		if [ -n "$FORCE" ] || [ "$_until" -le "$_now" ]; then
+			CANDIDATES="$CANDIDATES $_m"
+		fi
+		_i=$((_i + 1))
+	done
+	[ -n "$CANDIDATES" ] && return 0
+	log "skipped: every free model is waiting after errors"
+	return 1
+}
+
+# The next event starts with the model after the one that just answered.
+advance_rr() {
+	_k=0
+	for _m in $pool; do
+		_k=$((_k + 1))
+		if [ "$_m" = "$1" ]; then
+			echo $((_k % pool_n)) >"$RR"
+			return 0
+		fi
+	done
+}
+
+# Asks one model about $WORK/snap.jpg. On success sets DESC, NOTIFY, RULE.
+# Returns 0 on success, 1 when another model may do better, and 2 when no
+# model can (rejected key, no credit).
+try_model() {
+	USED_MODEL="$1"
 	DESC=""
 	NOTIFY=""
 	RULE=""
-	build_request
+	rm -f "$WORK/resp.json" "$WORK/answer.json" "$WORK/curl.err"
+	build_request "$1"
 
 	# Relative file names keep the paths short; the key goes to curl on
 	# stdin so it never shows up in the process list.
@@ -250,7 +363,7 @@ analyze() {
 		cd "$WORK" || exit 1
 		{
 			if [ -n "$api_key" ]; then
-				printf 'header = "Authorization: Bearer %s"\n' "$(printf '%s' "$api_key" | tr -d '"\\\r\n')"
+				printf 'header = "Authorization: Bearer %s"\n' "$(printf '%s' "$api_key" | tr -d '"\\r\n')"
 			fi
 		} | curl -K - --silent --show-error --http1.1 --tls-max 1.2 \
 			--connect-timeout 10 --max-time "$timeout" \
@@ -259,16 +372,32 @@ analyze() {
 			--data-binary @req.json -o resp.json -w '%{http_code}' \
 			"$endpoint" 2>curl.err
 	)
+
+	# How long a model that failed is left alone: only pools rotate away.
+	hold=0
 	if [ "$http" != "200" ]; then
 		err=$(cd "$WORK" && jct ./resp.json get error.message 2>/dev/null)
 		[ -n "$err" ] || err=$(head -c 200 "$WORK/curl.err" 2>/dev/null)
-		log "request failed: HTTP ${http:-none} $(clean "$err")"
+		log "request failed ($1): HTTP ${http:-none} $(clean "$err")"
+		case "$http" in
+			401 | 402)
+				usage_note "$1" 1 0
+				return 2
+				;;
+			400 | 403 | 408 | 429) hold=600 ;;
+			404) hold=3600 ;;
+			*) hold=300 ;;
+		esac
+		[ "$use_pool" = "true" ] || hold=0
+		usage_note "$1" 1 "$hold"
 		return 1
 	fi
+	[ "$use_pool" = "true" ] && hold=300
 
 	content=$(cd "$WORK" && jct ./resp.json get choices.0.message.content 2>/dev/null)
 	if [ -z "$content" ]; then
-		log "response has no message content"
+		log "response has no message content ($1)"
+		usage_note "$1" 1 "$hold"
 		return 1
 	fi
 
@@ -277,19 +406,41 @@ analyze() {
 	printf '%s' "$content" | tr '\r\n' '  ' | sed -e 's/^[^{]*//' -e 's/[^}]*$//' >"$WORK/answer.json"
 	DESC=$(safe "$(cd "$WORK" && jct ./answer.json get description 2>/dev/null)")
 	if [ -z "$DESC" ]; then
-		log "could not read a description from the reply: $(clean "$content")"
+		log "could not read a description from the reply ($1): $(clean "$content")"
+		usage_note "$1" 1 "$hold"
 		return 1
 	fi
 	NOTIFY=$(cd "$WORK" && jct ./answer.json get notify 2>/dev/null)
 	[ "$NOTIFY" = "true" ] || NOTIFY=false
 	RULE=$(safe "$(cd "$WORK" && jct ./answer.json get rule 2>/dev/null)")
+	usage_note "$1" 0 0
 	return 0
 }
 
+# Tries the chosen models in turn until one answers. On success sets DESC,
+# NOTIFY, RULE and USED_MODEL.
+analyze() {
+	USED_MODEL=""
+	choose_models || return 1
+	_tries=0
+	for _cand in $CANDIDATES; do
+		_tries=$((_tries + 1))
+		try_model "$_cand"
+		_rc=$?
+		if [ "$_rc" -eq 0 ]; then
+			[ "$use_pool" = "true" ] && advance_rr "$_cand"
+			return 0
+		fi
+		[ "$_rc" -eq 2 ] && return 1
+		[ "$_tries" -ge "$MAX_TRIES" ] && break
+	done
+	return 1
+}
+
 record_event() {
-	# $1 status, $2 description, $3 notify, $4 rule
-	printf '{"time":"%s","status":"%s","notify":%s,"description":"%s","rule":"%s"}\n' \
-		"$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" "${3:-false}" "$(json_str "$2")" "$(json_str "$4")" >>"$EVENTS"
+	# $1 status, $2 description, $3 notify, $4 rule, $5 model
+	printf '{"time":"%s","status":"%s","notify":%s,"description":"%s","rule":"%s","model":"%s"}\n' \
+		"$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" "${3:-false}" "$(json_str "$2")" "$(json_str "$4")" "$(json_str "$5")" >>"$EVENTS"
 	if [ "$(wc -l <"$EVENTS")" -gt "$EVENTS_KEEP" ]; then
 		tail -n "$EVENTS_KEEP" "$EVENTS" >"$EVENTS.tmp" && mv "$EVENTS.tmp" "$EVENTS"
 	fi
@@ -297,7 +448,7 @@ record_event() {
 
 send_to() {
 	# $1 service, $2 message, $3 rule
-	payload="{\"event\":\"motion\",\"camera\":\"$(json_str "$camera")\",\"description\":\"$(json_str "$2")\",\"rule\":\"$(json_str "$3")\",\"time\":\"$(date +%Y-%m-%dT%H:%M:%S%z)\"}"
+	payload="{\"event\":\"motion\",\"camera\":\"$(json_str "$camera")\",\"description\":\"$(json_str "$2")\",\"rule\":\"$(json_str "$3")\",\"time\":\"$(date +%Y-%m-%dT%H:%M:%S%z)\",\"model\":\"$(json_str "$USED_MODEL")\"}"
 	photo_flag=""
 	[ "$send_photo" = "false" ] || photo_flag="-S"
 
@@ -350,11 +501,11 @@ cmd_motion() {
 	take_snapshot "" || exit 1
 
 	if analyze; then
-		log "notify=$NOTIFY rule='$RULE' $DESC"
-		record_event ok "$DESC" "$NOTIFY" "$RULE"
+		log "notify=$NOTIFY rule='$RULE' model=$USED_MODEL $DESC"
+		record_event ok "$DESC" "$NOTIFY" "$RULE" "$USED_MODEL"
 		[ "$NOTIFY" = "true" ] && notify_all "$DESC" "$RULE"
 	else
-		record_event error "" false ""
+		record_event error "" false "" "$USED_MODEL"
 		if [ "$fallback" != "false" ]; then
 			notify_all "Motion detected (AI description unavailable)" ""
 		fi
@@ -376,7 +527,9 @@ cmd_test() {
 	make_workdir
 	take_snapshot "$1" || die "no usable snapshot"
 	AIWATCH_VERBOSE=1
+	FORCE=1
 	analyze || die "analysis failed"
+	echo "model: $USED_MODEL"
 	echo "description: $DESC"
 	echo "notify: $NOTIFY"
 	echo "rule: $RULE"
@@ -388,7 +541,11 @@ cmd_status() {
 	load_config
 	echo "enabled: ${enabled:-false}"
 	echo "endpoint: $endpoint"
-	echo "model: ${model:-(not set)}"
+	if [ "$use_pool" = "true" ] && [ -n "$pool" ]; then
+		echo "models: rotating $pool_n free models:$pool"
+	else
+		echo "model: ${model:-(not set)}"
+	fi
 	echo "rules: $rule_count"
 	today=$(date +%Y%m%d)
 	count=0
@@ -404,6 +561,32 @@ cmd_status() {
 	exit 0
 }
 
+cmd_usage() {
+	load_config
+	mkdir -p "$STATE_DIR"
+	[ -f "$USAGE" ] || : >"$USAGE"
+	_day=$(date +%Y%m%d)
+	_now=$(date +%s)
+	if [ "$1" = "json" ]; then
+		printf '['
+		awk -v day="$_day" -v now="$_now" '
+			$1 == day { printf "%s{\"model\":\"%s\",\"calls\":%d,\"failures\":%d,\"wait\":%d}", (n++ ? "," : ""), $2, $3, $4, ($5 > now ? $5 - now : 0) }
+		' "$USAGE"
+		printf ']\n'
+	else
+		if [ "$use_pool" = "true" ] && [ -n "$pool" ]; then
+			echo "mode: rotating free models ($(pool_calls) of $free_limit calls used today)"
+		else
+			echo "mode: single model $model"
+		fi
+		awk -v day="$_day" -v now="$_now" '
+			BEGIN { printf "%-52s %6s %9s  %s\n", "model", "calls", "failures", "state" }
+			$1 == day { printf "%-52s %6d %9d  %s\n", $2, $3, $4, ($5 > now ? "waiting " ($5 - now) "s after an error" : "ready") }
+		' "$USAGE"
+	fi
+	exit 0
+}
+
 case "$1" in
 	motion) cmd_motion ;;
 	test)
@@ -411,8 +594,12 @@ case "$1" in
 		cmd_test "$@"
 		;;
 	status) cmd_status ;;
+	usage)
+		shift
+		cmd_usage "$@"
+		;;
 	*)
-		echo "Usage: $0 motion | test [-n] [image.jpg] | status" >&2
+		echo "Usage: $0 motion | test [-n] [image.jpg] | status | usage [json]" >&2
 		exit 2
 		;;
 esac

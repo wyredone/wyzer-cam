@@ -1,583 +1,838 @@
-"""wyzer-cam SD card installer.
+"""wyzer-cam installer window.
 
-Prepares an SD card that sets up aiwatch on a camera running thingino:
-it copies the aiwatch script and a runonce.sh onto the card, together with
-the settings entered in the window. thingino runs runonce.sh once when the
-card is in the camera.
+  python installer/wyzer_installer.py
 
-Run:  python installer/wyzer_installer.py
+Two ways to get the AI addon (aiwatch) onto a Wyze Cam v3:
+  Camera (SSH)  for a camera that already runs thingino: find it on the
+                network, log in, install or update, test, uninstall.
+  SD card       prepares a card the camera reads when it starts, and can put
+                the thingino installer on it for a camera still on Wyze firmware.
 
-For a camera that is still on Wyze's firmware it can also put the thingino
-installer on the card: it downloads the community Wyze Cam v3 installer image
-and copies the files inside it to the card.
-
-Standard library only. The card is written with ordinary file copies; nothing
-is formatted and no disk is written raw.
+The settings tabs below (Wi-Fi, AI model, Rules and limits, Alerts) are shared.
+Nothing is formatted and no disk is written raw. Needs the `paramiko` package
+for SSH (pip install paramiko); everything else is the standard library.
 """
 
-import fnmatch
-import json
-import os
-import shutil
-import sys
+import queue
+import threading
 import time
-import urllib.request
-import zipfile
-from pathlib import Path
+import traceback
+import tkinter as tk
+import webbrowser
+from tkinter import filedialog, messagebox, ttk
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fatimage import FatError, FatImage  # noqa: E402
+import camera_ssh
+import discover
+import openrouter
+import telegram_helper
+import wyzer_core as core
 
-# The thingino installer for the Wyze Cam v3, maintained by wltechblog. It is a
-# disk image holding one FAT32 partition with a boot file that the stock
-# bootloader loads from the card, plus one firmware per hardware variant.
-THINGINO_IMAGE_URL = ("https://raw.githubusercontent.com/wltechblog/thingino-installers/"
-                      "main/wyze-cam-3/wyze-cam-3-sd.zip")
-THINGINO_BOOT_FILE = "factory_t31_ZMC6tiIDQN"
-THINGINO_FIRMWARE_PATTERN = "thingino-wyze_cam3_*.bin"
-FIRMWARE_BYTES = 16 * 1024 * 1024  # the camera's flash size
-UIMAGE_MAGIC = b"\x27\x05\x19\x56"
-IMAGE_CACHE_DAYS = 7
-MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
-FLASH_SPACE_BYTES = 64 * 1024 * 1024
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-AIWATCH_SRC = REPO_ROOT / "package" / "thingino-aiwatch" / "files" / "aiwatch"
-RUNONCE_SRC = Path(__file__).resolve().parent / "runonce.sh"
-# The settings page: (path in the package, path under wyzer/ on the card).
-WEBUI_SRC = REPO_ROOT / "package" / "thingino-aiwatch" / "files"
-WEBUI_FILES = (
-    ("www/config-aiwatch.html", "www/config-aiwatch.html"),
-    ("www/a/config-aiwatch.js", "www/a/config-aiwatch.js"),
-    ("www/x/json-aiwatch.cgi", "www/x/json-aiwatch.cgi"),
-    ("aiwatch.webui.json", "www/a/plugins/aiwatch.webui.json"),
-)
-RUNONCE_MARKER = b"wyzer-cam-runonce"
-DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-THINGINO_INSTALL_URL = "https://github.com/wltechblog/thingino-installers/tree/main/wyze-cam-3"
-SECRET_FILES = ("aiwatch.json", "send2.json", "wifi_ssid", "wifi_pass", "enable_motion")
-
-DEFAULTS = {
-    "wifi_ssid": "",
-    "wifi_pass": "",
-    "enabled": True,
-    "enable_motion": True,
-    "endpoint": DEFAULT_ENDPOINT,
-    "api_key": "",
-    "model": "",
-    "camera_name": "",
-    "context": "",
-    "language": "English",
-    "rules": [],
-    "cooldown": "60",
-    "daily_limit": "200",
-    "tg_token": "",
-    "tg_channel": "",
-    "ntfy_host": "ntfy.sh",
-    "ntfy_topic": "",
-}
+RECOMMENDED = core.RECOMMENDED_MODEL
+THINGINO_GUIDE = core.THINGINO_INSTALL_URL
+PAD = {"padx": 8, "pady": 3}
+TEXT_KEYS = ("wifi_ssid", "wifi_pass", "endpoint", "api_key", "model", "camera_name", "context", "language",
+             "extra_instructions", "cooldown", "daily_limit", "free_daily_limit", "max_attempts", "active_from",
+             "active_to", "tg_token", "tg_channel", "ntfy_host", "ntfy_topic")
+BOOL_KEYS = ("enabled", "enable_motion")
 
 
-# --- core logic (no GUI) -----------------------------------------------------
+class InstallerApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("wyzer-cam installer")
+        root.minsize(640, 0)
+        root.columnconfigure(0, weight=1)
+        self.inbox = queue.Queue()
+        self.known = camera_ssh.KnownHosts()
+        self.ex = None
+        self.host_key = None
+        self.camera_ready = False
+        self.busy = False
+        self.catalog = None
+        self.pool_ids = []
+        self.drive_paths = {}
+        self.buttons = []
+        self.v = {key: tk.StringVar(value=core.DEFAULTS[key]) for key in TEXT_KEYS}
+        self.v.update({key: tk.BooleanVar(value=core.DEFAULTS[key]) for key in BOOL_KEYS})
+        self.v.update(host=tk.StringVar(), user=tk.StringVar(value="root"), ssh_password=tk.StringVar(),
+                      use_key=tk.BooleanVar(value=bool(camera_ssh.find_key_files())),
+                      mode=tk.StringVar(value="single"), flash=tk.BooleanVar(value=False),
+                      target=tk.StringVar(), key_status=tk.StringVar(), model_info=tk.StringVar(),
+                      bot_status=tk.StringVar(), camera_status=tk.StringVar(value="Not connected."))
+        self.build()
+        self.fill(core.apply_profile(dict(core.DEFAULTS), core.load_profile()))
+        profile = core.load_profile()
+        self.v["host"].set(profile.get("camera_host", ""))
+        self.v["user"].set(profile.get("camera_user", "root") or "root")
+        self.refresh_drives()
+        self.say("Pick how to install, fill in the tabs, then press the button. "
+                 "Find cameras looks for thingino cameras on your network.")
+        self.poll()
+        root.bind("<Destroy>", lambda event: event.widget is root and root.after_cancel(self.poll_id))
+        self.load_catalog()
 
-def list_removable_drives():
-    """Removable drives as (path, description). Windows only; [] elsewhere."""
-    if sys.platform != "win32":
-        return []
-    import ctypes
+    # --- dialogs (replaced in tests) ---
 
-    kernel32 = ctypes.windll.kernel32
-    drives = []
-    mask = kernel32.GetLogicalDrives()
-    for i in range(26):
-        if not mask & (1 << i):
-            continue
-        root = "%s:\\" % chr(ord("A") + i)
-        if kernel32.GetDriveTypeW(root) != 2:  # DRIVE_REMOVABLE
-            continue
-        label = ctypes.create_unicode_buffer(261)
-        fs = ctypes.create_unicode_buffer(261)
-        if not kernel32.GetVolumeInformationW(root, label, 261, None, None, None, fs, 261):
-            continue  # reader with no card in it
-        try:
-            size_gb = shutil.disk_usage(root).total / 1e9
-        except OSError:
-            continue
-        text = "%s  %s  %s  %.1f GB" % (root, label.value or "(no label)", fs.value, size_gb)
-        drives.append((root, text))
-    return drives
+    def confirm(self, title, text):
+        return messagebox.askyesno(title, text, parent=self.root)
 
+    def inform(self, title, text):
+        messagebox.showinfo(title, text, parent=self.root)
 
-def services(settings):
-    result = []
-    if settings["tg_token"] and settings["tg_channel"]:
-        result.append("telegram")
-    if settings["ntfy_topic"]:
-        result.append("ntfy")
-    return result
+    def error(self, title, text):
+        messagebox.showerror(title, text, parent=self.root)
 
+    def choose_chat(self, chats):
+        """Shows the chats found for the bot; returns the chosen one or None."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose the chat for alerts")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="These chats messaged your bot. Pick the one that should get alerts.").grid(row=0, column=0, **PAD)
+        box = tk.Listbox(dialog, height=min(8, len(chats)), width=60, exportselection=False)
+        for chat in chats:
+            box.insert("end", "%s    (%s, id %s)" % (chat["name"], chat["type"], chat["id"]))
+        box.selection_set(0)
+        box.grid(row=1, column=0, **PAD)
+        chosen = []
 
-def card_info(path):
-    """(file system name or None if unknown, free bytes) for the card."""
-    fs_name = None
-    if sys.platform == "win32":
-        import ctypes
+        def ok():
+            if box.curselection():
+                chosen.append(chats[box.curselection()[0]])
+            dialog.destroy()
 
-        root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
-        fs = ctypes.create_unicode_buffer(261)
-        if ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs, 261):
-            fs_name = fs.value
-    return fs_name, shutil.disk_usage(str(path)).free
+        ttk.Button(dialog, text="Use this chat", command=ok).grid(row=2, column=0, sticky="e", **PAD)
+        dialog.wait_window()
+        return chosen[0] if chosen else None
 
+    # --- layout ---
 
-def image_cache_path():
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
-    return Path(base) / "wyzer-cam" / "wyze-cam-3-sd.zip"
+    def build(self):
+        root = self.root
+        self.where = ttk.Notebook(root)
+        self.where.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        self.build_ssh_tab()
+        self.build_sd_tab()
 
+        self.tabs = ttk.Notebook(root)
+        self.tabs.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        self.build_wifi_tab()
+        self.build_model_tab()
+        self.build_rules_tab()
+        self.build_alerts_tab()
 
-def download_thingino_image(dest, progress=None, url=THINGINO_IMAGE_URL):
-    """Downloads the installer image to `dest`, reusing a recent copy.
+        log_frame = ttk.Frame(root)
+        log_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 10))
+        log_frame.columnconfigure(0, weight=1)
+        self.log = tk.Text(log_frame, height=7, width=70, wrap="word", state="disabled")
+        self.log.grid(row=0, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=scroll.set)
 
-    `progress(done_bytes, total_bytes)` is called while downloading.
-    Returns True if a download happened, False if the cached copy was used.
-    """
-    dest = Path(dest)
-    if (dest.is_file() and zipfile.is_zipfile(dest)
-            and time.time() - dest.stat().st_mtime < IMAGE_CACHE_DAYS * 86400):
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + ".part")
-    with urllib.request.urlopen(url, timeout=30) as response, open(part, "wb") as out:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        while True:
-            chunk = response.read(256 * 1024)
-            if not chunk:
-                break
-            done += len(chunk)
-            if done > MAX_DOWNLOAD_BYTES:
-                raise ValueError("the download is larger than expected; stopped")
-            out.write(chunk)
-            if progress:
-                progress(done, total)
-    if not zipfile.is_zipfile(part):
-        part.unlink()
-        raise ValueError("the downloaded file is not a zip archive")
-    os.replace(part, dest)
-    return True
+    def button(self, parent, text, command, **grid):
+        b = ttk.Button(parent, text=text, command=command)
+        b.grid(**grid)
+        self.buttons.append(b)
+        return b
 
-
-def read_thingino_files(zip_path):
-    """The installer's files from the downloaded image, as {name: bytes}.
-
-    Only the boot file and the Wyze Cam v3 firmware files are taken, and each
-    is checked, so an unexpected image is rejected instead of copied.
-    """
-    with zipfile.ZipFile(zip_path) as archive:
-        images = [i for i in archive.infolist() if i.filename.lower().endswith(".img")]
-        if len(images) != 1:
-            raise ValueError("expected one disk image in the download, found %d" % len(images))
-        if images[0].file_size > 1024 ** 3:
-            raise ValueError("the disk image in the download is larger than expected")
-        data = archive.read(images[0])  # also verifies the zip checksum
-
-    try:
-        found = {path: content for path, content in FatImage(data).files()
-                 if path == THINGINO_BOOT_FILE or fnmatch.fnmatchcase(path, THINGINO_FIRMWARE_PATTERN)}
-    except FatError as exc:
-        raise ValueError("could not read the installer image: %s" % exc)
-
-    boot = found.get(THINGINO_BOOT_FILE)
-    firmware = [name for name in found if name != THINGINO_BOOT_FILE]
-    if boot is None or not boot.startswith(UIMAGE_MAGIC):
-        raise ValueError("the installer image has no valid %s" % THINGINO_BOOT_FILE)
-    if not firmware:
-        raise ValueError("the installer image has no Wyze Cam v3 firmware")
-    for name in firmware:
-        if len(found[name]) != FIRMWARE_BYTES:
-            raise ValueError("%s is not a 16 MB firmware image" % name)
-    return found
-
-
-def write_thingino_files(target, files):
-    target = Path(target)
-    for name, content in files.items():
-        _write(target / name, content)
-    count = len(files) - 1
-    return ["Copied the thingino installer and %d firmware file%s" % (count, "" if count == 1 else "s")]
-
-
-def validate(settings, target, flash=False):
-    """Returns (errors, warnings) as lists of sentences."""
-    errors, warnings = [], []
-    target = Path(target) if target else None
-    if not target or not target.is_dir():
-        errors.append("Choose the SD card (or a folder) to write to.")
-    elif flash:
-        fs_name, free = card_info(target)
-        if fs_name is not None and fs_name.upper() != "FAT32":
-            errors.append("To install thingino the card must be formatted FAT32; this one is %s. "
-                          "Cards over 32 GB usually are not." % fs_name)
-        if free < FLASH_SPACE_BYTES:
-            errors.append("The card needs at least 64 MB free for the thingino installer.")
-
-    ssid, password = settings["wifi_ssid"], settings["wifi_pass"]
-    if ssid:
-        if len(ssid.encode("utf-8")) > 32:
-            errors.append("The Wi-Fi name is longer than 32 bytes.")
-        if not 8 <= len(password) <= 64:
-            errors.append("The Wi-Fi password must be 8 to 64 characters.")
-        if any(c in ssid + password for c in "\r\n"):
-            errors.append("The Wi-Fi name and password cannot contain line breaks.")
-    elif password:
-        errors.append("A Wi-Fi password is set but the Wi-Fi name is empty.")
-
-    if not settings["endpoint"].startswith(("http://", "https://")):
-        errors.append("The endpoint must start with http:// or https://.")
-    if settings["enabled"] and not settings["model"]:
-        errors.append("Enter a model id, or untick 'Turn AI alerts on'.")
-    for key, name in (("cooldown", "Cooldown"), ("daily_limit", "Daily limit")):
-        if not str(settings[key]).isdigit():
-            errors.append("%s must be a whole number." % name)
-    if len(settings["rules"]) > 10:
-        errors.append("At most 10 alert rules are supported.")
-    if bool(settings["tg_token"]) != bool(settings["tg_channel"]):
-        errors.append("Telegram needs both the bot token and the chat ID.")
-
-    if not errors:
-        if settings["enabled"] and not settings["api_key"] and "openrouter.ai" in settings["endpoint"]:
-            warnings.append("No API key is set; OpenRouter will reject the requests.")
-        if settings["enabled"] and not services(settings):
-            warnings.append("No Telegram or ntfy details are set, so alerts have nowhere to go "
-                            "unless the camera's notifiers are already configured.")
-    return errors, warnings
-
-
-def build_aiwatch_config(settings):
-    return {
-        "enabled": bool(settings["enabled"]),
-        "endpoint": settings["endpoint"],
-        "api_key": settings["api_key"],
-        "model": settings["model"],
-        "camera_name": settings["camera_name"],
-        "context": settings["context"],
-        "language": settings["language"] or "English",
-        "rules": list(settings["rules"]),
-        "filter_empty": True,
-        "services": services(settings) or ["telegram"],
-        "send_photo": True,
-        "fallback_on_error": True,
-        "cooldown": int(settings["cooldown"]),
-        "daily_limit": int(settings["daily_limit"]),
-        "snapshot_channel": 1,
-        "max_image_kb": 600,
-        "timeout": 30,
-    }
-
-
-def build_send2_overlay(settings):
-    """Only the notifier keys the user filled in; merged on the camera."""
-    overlay = {}
-    if settings["tg_token"] and settings["tg_channel"]:
-        overlay["telegram"] = {"token": settings["tg_token"], "channel": settings["tg_channel"]}
-    if settings["ntfy_topic"]:
-        overlay["ntfy"] = {
-            "host": settings["ntfy_host"] or "ntfy.sh",
-            "port": 443,
-            "use_ssl": True,
-            "topic": settings["ntfy_topic"],
-        }
-    return overlay
-
-
-def foreign_runonce(target):
-    """True if the card has a runonce.sh that this tool did not write."""
-    path = Path(target) / "runonce.sh"
-    try:
-        return path.is_file() and RUNONCE_MARKER not in path.read_bytes()[:400]
-    except OSError:
-        return False
-
-
-def _unix_script(path):
-    """A shell script's bytes with Unix line endings, whatever the checkout did."""
-    return Path(path).read_bytes().replace(b"\r\n", b"\n")
-
-
-def _write(path, data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    with open(path, "wb") as f:
-        f.write(data)
-
-
-def prepare_card(target, settings):
-    """Writes the setup files to `target`. Returns the list of what was done."""
-    target = Path(target)
-    for src in (AIWATCH_SRC, RUNONCE_SRC):
-        if not src.is_file():
-            raise FileNotFoundError("%s is missing; run this from a full copy of the repository" % src)
-
-    done = []
-    data_dir = target / "wyzer"
-    data_dir.mkdir(exist_ok=True)
-
-    # Leftovers from an earlier run must not leak into this one.
-    for name in SECRET_FILES:
-        (data_dir / name).unlink(missing_ok=True)
-    flag = target / "runonce.done"
-    if flag.exists():
-        flag.unlink()
-        done.append("Removed runonce.done from an earlier setup")
-
-    _write(target / "runonce.sh", _unix_script(RUNONCE_SRC))
-    _write(data_dir / "aiwatch", _unix_script(AIWATCH_SRC))
-    done.append("Copied runonce.sh and the aiwatch script")
-
-    if all((WEBUI_SRC / src).is_file() for src, _ in WEBUI_FILES):
-        for src, dest in WEBUI_FILES:
-            (data_dir / dest).parent.mkdir(parents=True, exist_ok=True)
-            _write(data_dir / dest, _unix_script(WEBUI_SRC / src))
-        done.append("Copied the AI Alerts page for the camera's web interface")
-
-    _write(data_dir / "aiwatch.json", json.dumps(build_aiwatch_config(settings), indent=2) + "\n")
-    done.append("Wrote AI settings (%d rule%s)" % (len(settings["rules"]), "" if len(settings["rules"]) == 1 else "s"))
-
-    overlay = build_send2_overlay(settings)
-    if overlay:
-        _write(data_dir / "send2.json", json.dumps(overlay, indent=2) + "\n")
-        done.append("Wrote notifier settings: " + ", ".join(sorted(overlay)))
-
-    if settings["enable_motion"]:
-        _write(data_dir / "enable_motion", "1\n")
-        done.append("Motion detection will be turned on")
-
-    if settings["wifi_ssid"]:
-        _write(data_dir / "wifi_ssid", settings["wifi_ssid"])
-        _write(data_dir / "wifi_pass", settings["wifi_pass"])
-        done.append("Wrote Wi-Fi settings for '%s'" % settings["wifi_ssid"])
-
-    return done
-
-
-# --- GUI ---------------------------------------------------------------------
-
-def run_gui():
-    import threading
-    import tkinter as tk
-    import webbrowser
-    from tkinter import filedialog, messagebox, ttk
-
-    root = tk.Tk()
-    root.title("wyzer-cam SD card installer")
-    root.minsize(560, 0)
-    root.columnconfigure(0, weight=1)
-    pad = {"padx": 8, "pady": 3}
-
-    var = {key: tk.StringVar(value=value) for key, value in DEFAULTS.items() if isinstance(value, str)}
-    var["enabled"] = tk.BooleanVar(value=True)
-    var["enable_motion"] = tk.BooleanVar(value=True)
-    target_var = tk.StringVar()
-    drive_paths = {}
-
-    def field(parent, row, label, key, show=None, hint=None):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", **pad)
-        entry = ttk.Entry(parent, textvariable=var[key], show=show or "")
-        entry.grid(row=row, column=1, sticky="ew", **pad)
+    def field(self, parent, row, label, key, show=None, width=None, hint=None):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", **PAD)
+        entry = ttk.Entry(parent, textvariable=self.v[key], show=show or "", width=width or 40)
+        entry.grid(row=row, column=1, sticky="ew", **PAD)
         if hint:
-            ttk.Label(parent, text=hint, foreground="#666").grid(row=row + 1, column=1, sticky="w", padx=8)
+            ttk.Label(parent, text=hint, foreground="#666").grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=8)
         return entry
 
-    def secret_field(parent, row, label, key):
-        entry = field(parent, row, label, key, show="\u2022")
+    def secret(self, parent, row, label, key, hint=None):
+        entry = self.field(parent, row, label, key, show="•", hint=hint)
         shown = tk.BooleanVar(value=False)
+        ttk.Checkbutton(parent, text="Show", variable=shown,
+                        command=lambda: entry.configure(show="" if shown.get() else "•")).grid(row=row, column=2, **PAD)
+        return entry
 
-        def toggle():
-            entry.configure(show="" if shown.get() else "\u2022")
+    def build_ssh_tab(self):
+        tab = ttk.Frame(self.where)
+        tab.columnconfigure(1, weight=1)
+        self.where.add(tab, text="Camera (SSH)")
+        ttk.Label(tab, text="Camera address").grid(row=0, column=0, sticky="w", **PAD)
+        self.host_box = ttk.Combobox(tab, textvariable=self.v["host"])
+        self.host_box.grid(row=0, column=1, sticky="ew", **PAD)
+        self.button(tab, "Find cameras", self.find_cameras, row=0, column=2, **PAD)
+        ttk.Label(tab, text="User").grid(row=1, column=0, sticky="w", **PAD)
+        ttk.Entry(tab, textvariable=self.v["user"], width=14).grid(row=1, column=1, sticky="w", **PAD)
+        self.secret(tab, 2, "Password", "ssh_password")
+        ttk.Checkbutton(tab, text="Use my SSH key when I have one (then the password is optional)",
+                        variable=self.v["use_key"]).grid(row=3, column=1, columnspan=2, sticky="w", **PAD)
+        self.button(tab, "Connect and check", self.connect, row=4, column=0, **PAD)
+        ttk.Label(tab, textvariable=self.v["camera_status"], wraplength=440, justify="left").grid(
+            row=4, column=1, columnspan=2, sticky="w", **PAD)
+        actions = ttk.Frame(tab)
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 6))
+        self.install_button = self.button(actions, "Install / update", self.install_ssh, row=0, column=0, **PAD)
+        self.button(actions, "Test AI", lambda: self.test_ssh(False), row=0, column=1, **PAD)
+        self.button(actions, "Test and send alert", lambda: self.test_ssh(True), row=0, column=2, **PAD)
+        self.button(actions, "Uninstall", self.uninstall_ssh, row=0, column=3, **PAD)
+        self.button(actions, "Set up key login", self.setup_key, row=1, column=0, **PAD)
+        self.button(actions, "Restart camera", self.restart_ssh, row=1, column=1, **PAD)
 
-        ttk.Checkbutton(parent, text="Show", variable=shown, command=toggle).grid(row=row, column=2, **pad)
+    def build_sd_tab(self):
+        tab = ttk.Frame(self.where)
+        tab.columnconfigure(0, weight=1)
+        self.where.add(tab, text="SD card")
+        self.drive_box = ttk.Combobox(tab, textvariable=self.v["target"])
+        self.drive_box.grid(row=0, column=0, sticky="ew", **PAD)
+        self.button(tab, "Refresh", self.refresh_drives, row=0, column=1, **PAD)
+        self.button(tab, "Browse…", self.browse, row=0, column=2, **PAD)
+        ttk.Label(tab, foreground="#666", wraplength=560, justify="left",
+                  text="Files are added to the card; nothing is formatted or erased. The card must be FAT32. "
+                       "A large FAT32 card (for example 128 GB) works for the files, but the Wyze bootloader "
+                       "is only known to read cards of 32 GB or less when installing thingino.").grid(
+            row=1, column=0, columnspan=3, sticky="w", **PAD)
+        ttk.Checkbutton(tab, variable=self.v["flash"],
+                        text="Camera is still on Wyze firmware: also install thingino (25 MB download)").grid(
+            row=2, column=0, columnspan=2, sticky="w", **PAD)
+        ttk.Button(tab, text="About", command=lambda: webbrowser.open(THINGINO_GUIDE)).grid(row=2, column=2, **PAD)
+        self.write_button = self.button(tab, "Write to SD card", self.write_sd, row=3, column=2, sticky="e", **PAD)
 
-    # --- card ---
-    card = ttk.LabelFrame(root, text="1. SD card")
-    card.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
-    card.columnconfigure(0, weight=1)
-    drive_box = ttk.Combobox(card, textvariable=target_var)
-    drive_box.grid(row=0, column=0, sticky="ew", **pad)
+    def build_wifi_tab(self):
+        tab = ttk.Frame(self.tabs)
+        tab.columnconfigure(1, weight=1)
+        self.tabs.add(tab, text="Wi-Fi")
+        self.field(tab, 0, "Network name", "wifi_ssid",
+                   hint="Leave empty to keep the camera's current Wi-Fi. A wrong password cuts the camera off until it is reset.")
+        self.secret(tab, 2, "Password", "wifi_pass")
 
-    def refresh_drives():
-        drives = list_removable_drives()
-        drive_paths.clear()
-        drive_paths.update({text: path for path, text in drives})
-        drive_box["values"] = [text for _, text in drives]
-        if drives and not target_var.get():
-            target_var.set(drives[0][1])
+    def build_model_tab(self):
+        tab = ttk.Frame(self.tabs)
+        tab.columnconfigure(1, weight=1)
+        self.tabs.add(tab, text="AI model")
+        ttk.Checkbutton(tab, text="Turn AI alerts on", variable=self.v["enabled"]).grid(
+            row=0, column=0, columnspan=3, sticky="w", **PAD)
+        ttk.Checkbutton(tab, text="Turn the camera's motion detection on", variable=self.v["enable_motion"]).grid(
+            row=1, column=0, columnspan=3, sticky="w", **PAD)
+        self.field(tab, 2, "Endpoint", "endpoint")
+        self.secret(tab, 3, "API key", "api_key", hint="Blank on an update keeps the key already on the camera.")
+        self.button(tab, "Check key", self.check_key, row=4, column=2, **PAD)
+        ttk.Label(tab, textvariable=self.v["key_status"], wraplength=420, justify="left", foreground="#444").grid(
+            row=5, column=1, columnspan=2, sticky="w", padx=8)
 
-    def browse():
+        modes = ttk.Frame(tab)
+        modes.grid(row=6, column=0, columnspan=3, sticky="w", **PAD)
+        ttk.Radiobutton(modes, text="One model", value="single", variable=self.v["mode"], command=self.show_mode).grid(row=0, column=0, padx=(0, 16))
+        ttk.Radiobutton(modes, text="Rotate between free models", value="pool", variable=self.v["mode"], command=self.show_mode).grid(row=0, column=1)
+
+        self.single_frame = ttk.Frame(tab)
+        self.single_frame.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.single_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.single_frame, text="Model").grid(row=0, column=0, sticky="w", **PAD)
+        self.model_box = ttk.Combobox(self.single_frame, textvariable=self.v["model"])
+        self.model_box.grid(row=0, column=1, sticky="ew", **PAD)
+        self.model_box.bind("<<ComboboxSelected>>", lambda e: self.show_model_info())
+        self.model_box.bind("<FocusOut>", lambda e: self.show_model_info())
+        self.button(self.single_frame, "Use recommended", lambda: (self.v["model"].set(RECOMMENDED), self.show_model_info()),
+                    row=0, column=2, **PAD)
+        ttk.Label(self.single_frame, foreground="#666",
+                  text="Recommended: %s (cheap, fast). The list is image-capable OpenRouter models, cheapest first." % RECOMMENDED,
+                  wraplength=560, justify="left").grid(row=1, column=1, columnspan=2, sticky="w", padx=8)
+        self.button(self.single_frame, "Check model", self.check_model, row=2, column=2, **PAD)
+        ttk.Label(self.single_frame, textvariable=self.v["model_info"], foreground="#444", wraplength=420,
+                  justify="left").grid(row=2, column=1, sticky="w", padx=8)
+
+        self.pool_frame = ttk.Frame(tab)
+        self.pool_frame.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.pool_frame.columnconfigure(0, weight=1)
+        ttk.Label(self.pool_frame, text="Free models to rotate between (select one or more)").grid(row=0, column=0, sticky="w", **PAD)
+        holder = ttk.Frame(self.pool_frame)
+        holder.grid(row=1, column=0, sticky="ew", **PAD)
+        holder.columnconfigure(0, weight=1)
+        self.pool_list = tk.Listbox(holder, selectmode="multiple", exportselection=False, height=6)
+        self.pool_list.grid(row=0, column=0, sticky="ew")
+        bar = ttk.Scrollbar(holder, command=self.pool_list.yview)
+        bar.grid(row=0, column=1, sticky="ns")
+        self.pool_list.configure(yscrollcommand=bar.set)
+        limits = ttk.Frame(self.pool_frame)
+        limits.grid(row=2, column=0, sticky="w", **PAD)
+        ttk.Label(limits, text="Free calls per day").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(limits, textvariable=self.v["free_daily_limit"], width=6).grid(row=0, column=1, padx=(0, 16))
+        ttk.Label(limits, text="Models to try per event").grid(row=0, column=2, padx=(0, 4))
+        ttk.Entry(limits, textvariable=self.v["max_attempts"], width=6).grid(row=0, column=3, padx=(0, 16))
+        self.button(limits, "Reload list", self.load_catalog, row=0, column=4)
+        ttk.Label(self.pool_frame, foreground="#666", wraplength=580, justify="left",
+                  text="Each event starts with the model after the one that last answered; a model that fails is "
+                       "skipped for a few minutes. OpenRouter applies its free daily allowance to your whole account "
+                       "across all free models, so rotating helps with rate limits and outages but adds no calls. "
+                       "Free models can be run by providers that keep or train on what they receive: check "
+                       "OpenRouter's privacy settings first.").grid(row=3, column=0, sticky="w", padx=8)
+        self.show_mode()
+
+    def build_rules_tab(self):
+        tab = ttk.Frame(self.tabs)
+        tab.columnconfigure(1, weight=1)
+        self.tabs.add(tab, text="Rules and limits")
+        self.field(tab, 0, "Camera name", "camera_name", hint="Uses the camera's hostname when empty.")
+        self.field(tab, 2, "What the camera sees", "context", hint="One line, such as: Front porch facing the street")
+        self.field(tab, 4, "Language", "language")
+        self.field(tab, 5, "Extra instructions", "extra_instructions", hint="For example: the grey cat lives here; do not report it")
+        ttk.Label(tab, text="Alert rules").grid(row=7, column=0, sticky="nw", **PAD)
+        self.rules_box = tk.Text(tab, height=4, width=40, wrap="word")
+        self.rules_box.grid(row=7, column=1, sticky="ew", **PAD)
+        ttk.Label(tab, foreground="#666", text="One per line, up to 10. Empty: alert on anything notable.").grid(
+            row=8, column=1, sticky="w", padx=8)
+        limits = ttk.Frame(tab)
+        limits.grid(row=9, column=0, columnspan=3, sticky="w", **PAD)
+        for column, (label, key, width) in enumerate((("Seconds between calls", "cooldown", 6), ("Events per day", "daily_limit", 6),
+                                                      ("Active from", "active_from", 7), ("until", "active_to", 7))):
+            ttk.Label(limits, text=label).grid(row=0, column=2 * column, padx=(8, 4))
+            ttk.Entry(limits, textvariable=self.v[key], width=width).grid(row=0, column=2 * column + 1)
+        ttk.Label(tab, foreground="#666", text="Active times like 22:00 to 06:00; leave empty for all day.").grid(
+            row=10, column=1, sticky="w", padx=8)
+
+    def build_alerts_tab(self):
+        tab = ttk.Frame(self.tabs)
+        tab.columnconfigure(1, weight=1)
+        self.tabs.add(tab, text="Alerts")
+        self.secret(tab, 0, "Telegram bot token", "tg_token")
+        self.button(tab, "Check bot", self.check_bot, row=1, column=2, **PAD)
+        ttk.Label(tab, textvariable=self.v["bot_status"], foreground="#444").grid(row=1, column=1, sticky="w", padx=8)
+        self.field(tab, 2, "Telegram chat ID", "tg_channel")
+        self.button(tab, "Find my chat", self.find_chat, row=2, column=2, **PAD)
+        self.button(tab, "Send test message", self.send_test_message, row=3, column=2, **PAD)
+        ttk.Label(tab, foreground="#666", text="To find your chat: open Telegram, send any message to your bot, then press Find my chat.").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=8)
+        ttk.Separator(tab).grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        self.field(tab, 5, "ntfy server", "ntfy_host")
+        self.field(tab, 6, "ntfy topic", "ntfy_topic", hint="Leave a service empty to skip it. Alerts also need the camera's own Send to services settings for ntfy.")
+
+    # --- settings <-> window ---
+
+    def collect(self):
+        s = {key: self.v[key].get().strip() for key in TEXT_KEYS}
+        s["wifi_pass"] = self.v["wifi_pass"].get()  # spaces can be part of a password
+        s.update({key: bool(self.v[key].get()) for key in BOOL_KEYS})
+        s["free_pool"] = self.v["mode"].get() == "pool"
+        s["free_models"] = self.selected_pool()
+        s["rules"] = [line.strip() for line in self.rules_box.get("1.0", "end").splitlines() if line.strip()]
+        s["extra_instructions"] = " ".join(s["extra_instructions"].split())
+        return s
+
+    def fill(self, s):
+        for key in TEXT_KEYS:
+            if key in s:
+                self.v[key].set(str(s[key]))
+        for key in BOOL_KEYS:
+            if key in s:
+                self.v[key].set(bool(s[key]))
+        self.v["mode"].set("pool" if s.get("free_pool") else "single")
+        self.rules_box.delete("1.0", "end")
+        self.rules_box.insert("end", "\n".join(s.get("rules", [])))
+        self.set_pool_choices(s.get("free_models", []))
+        self.show_mode()
+        self.show_model_info()
+
+    def show_mode(self):
+        pool = self.v["mode"].get() == "pool"
+        (self.pool_frame if pool else self.single_frame).grid()
+        (self.single_frame if pool else self.pool_frame).grid_remove()
+
+    # --- log and tasks ---
+
+    def say(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def show(self, lines):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        for line in lines:
+            self.say(line)
+
+    def say_later(self, text):
+        """say() for worker threads."""
+        self.post(lambda: self.say(text))
+
+    def post(self, function):
+        """Runs `function` on the window's thread. Safe to call from any thread."""
+        self.inbox.put(function)
+
+    def poll(self):
+        try:
+            while True:
+                function = self.inbox.get_nowait()
+                try:
+                    function()
+                except Exception:  # one failing callback must not stop the window
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        self.poll_id = self.root.after(30, self.poll)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        for b in self.buttons:
+            b.state(["disabled"] if busy else ["!disabled"])
+
+    def run_task(self, work, done, label=None):
+        """Runs `work()` off the window's thread, then `done(result, error)` on it."""
+        if self.busy:
+            return
+        self.set_busy(True)
+        if label:
+            self.say(label)
+
+        def target():
+            try:
+                result, error = work(), None
+            except Exception as exc:  # shown to the user by done()
+                result, error = None, exc
+            self.post(lambda: self.finish_task(done, result, error))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def finish_task(self, done, result, error):
+        self.set_busy(False)
+        done(result, error)
+
+    def fail(self, title, error):
+        text = str(error) or error.__class__.__name__
+        self.say("Stopped: " + text)
+        self.error(title, text)
+
+    # --- model list, key check ---
+
+    def load_catalog(self):
+        """Fetches OpenRouter's model list in the background; the window stays usable meanwhile."""
+        if not core.is_openrouter(self.v["endpoint"].get()):
+            return
+
+        def work():
+            try:
+                result, error = openrouter.fetch_catalog(), None
+            except Exception as exc:  # a missing list is not fatal: the model id can be typed
+                result, error = None, exc
+            self.post(lambda: done(result, error))
+
+        def done(result, error):
+            if error:
+                self.say("Could not load OpenRouter's model list (%s). You can still type a model id." % error)
+                return
+            self.catalog = result
+            self.model_box["values"] = [m["id"] for m in result["paid"][:80]]
+            self.set_pool_choices(self.selected_pool())
+            self.show_model_info()
+            self.say("Loaded %d paid and %d free image-capable models from OpenRouter." % (len(result["paid"]), len(result["free"])))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_pool_choices(self, selected):
+        selected = list(selected)
+        known = [m for m in (self.catalog["free"] if self.catalog else [])]
+        ids, labels = [], []
+        for m in known:
+            ids.append(m["id"])
+            labels.append(m["id"] + ("   (reasoning model, may run out of answer space)" if m["reasoning"] else ""))
+        for model_id in selected:
+            if model_id not in ids:
+                ids.append(model_id)
+                labels.append(model_id + ("   (not in the current list)" if self.catalog else ""))
+        self.pool_ids = ids
+        self.pool_list.delete(0, "end")
+        for index, label in enumerate(labels):
+            self.pool_list.insert("end", label)
+            if ids[index] in selected:
+                self.pool_list.selection_set(index)
+
+    def selected_pool(self):
+        return [self.pool_ids[i] for i in self.pool_list.curselection()]
+
+    def show_model_info(self):
+        model = self.v["model"].get().strip()
+        for entry in (self.catalog["paid"] + self.catalog["free"]) if self.catalog else []:
+            if entry["id"] == model:
+                self.v["model_info"].set("$%.2f in / $%.2f out per million tokens" % (entry["input"], entry["output"])
+                                         if entry["input"] == entry["input"] else "price not listed")
+                return
+        self.v["model_info"].set("")
+
+    def check_model(self):
+        model = self.v["model"].get().strip()
+        if not model:
+            self.v["model_info"].set("Enter a model id first.")
+            return
+        if not self.catalog:
+            self.v["model_info"].set("The model list is not loaded (OpenRouter only). Press Reload list on the free models option, or check your connection.")
+            return
+        ok, message = openrouter.check_model(self.catalog, model)
+        self.v["model_info"].set(message)
+
+    def check_key(self):
+        key = self.v["api_key"].get().strip()
+        if not core.is_openrouter(self.v["endpoint"].get()):
+            self.v["key_status"].set("Key checking is only available for OpenRouter endpoints.")
+            return
+        self.v["key_status"].set("Checking…")
+        self.run_task(lambda: openrouter.check_key(key), lambda r, e: self.v["key_status"].set(
+            str(e) if e else ("✓ " if r[0] else "✗ " if r[0] is False else "? ") + r[1]))
+
+    # --- Telegram ---
+
+    def check_bot(self):
+        token = self.v["tg_token"].get().strip()
+        self.v["bot_status"].set("Checking…")
+
+        def done(result, error):
+            if error:
+                self.v["bot_status"].set("✗ " + str(error))
+            else:
+                self.v["bot_status"].set("✓ Bot @%s" % result["username"])
+
+        self.run_task(lambda: telegram_helper.get_me(token), done)
+
+    def find_chat(self):
+        token = self.v["tg_token"].get().strip()
+
+        def done(chats, error):
+            if error:
+                return self.fail("Telegram", error)
+            if not chats:
+                return self.inform("No messages found", "Open Telegram, find your bot, press Start or send it any "
+                                   "message, then press Find my chat again. (Telegram keeps a bot's messages for a day.)")
+            chat = self.choose_chat(chats)
+            if chat:
+                self.v["tg_channel"].set(str(chat["id"]))
+                self.say("Chat set to %s (%s)." % (chat["name"], chat["id"]))
+
+        self.run_task(lambda: telegram_helper.find_chats(token), done, "Looking for messages to your bot…")
+
+    def send_test_message(self):
+        token, chat = self.v["tg_token"].get().strip(), self.v["tg_channel"].get().strip()
+        if not token or not chat:
+            return self.inform("Telegram", "Enter the bot token and the chat ID first.")
+
+        def done(_, error):
+            if error:
+                return self.fail("Telegram", error)
+            self.inform("Telegram", "Sent. Check Telegram for the test message.")
+
+        self.run_task(lambda: telegram_helper.send_test(token, chat), done, "Sending a test message…")
+
+    # --- camera (SSH) ---
+
+    def current_host(self):
+        host, port = parse_address(self.v["host"].get())
+        return host if port == 22 else "%s:%d" % (host, port)
+
+    def find_cameras(self):
+        def work():
+            return discover.scan_local(progress=lambda done, total: (
+                self.say_later("Scanning your network… %d of %d addresses" % (done, total)) if done % 64 == 0 else None))
+
+        def done(result, error):
+            if error:
+                return self.fail("Find cameras", error)
+            found, network = result
+            if network is None:
+                return self.say("Could not work out which network this computer is on. Type the camera's address instead.")
+            labels = ["%s    %s" % (f["host"], "thingino camera" if f["thingino"] else f["banner"] or "SSH device") for f in found]
+            self.host_box["values"] = labels
+            cameras = [i for i, f in enumerate(found) if f["thingino"]]
+            if cameras:
+                self.v["host"].set(labels[cameras[0]])
+            self.say("Scanned %s: %d device%s with SSH, %d look like thingino cameras. %s" % (
+                network, len(found), "" if len(found) == 1 else "s", len(cameras),
+                "Pick one in the Camera address list." if len(found) > 1 else ""))
+
+        self.run_task(work, done, "Scanning your network for cameras…")
+
+    def connect(self):
+        host, port = parse_address(self.v["host"].get())
+        if not host:
+            return self.inform("Camera address", "Enter the camera's address, or press Find cameras.")
+        self.run_task(lambda: camera_ssh.fetch_host_key(host, port), lambda r, e: self.after_host_key(host, port, r, e),
+                      "Contacting %s…" % host)
+
+    def after_host_key(self, host, port, result, error):
+        if error:
+            return self.fail("Connect", error)
+        key, fp = result
+        state = self.known.check(self.current_host(), fp)
+        if state == "new" and not self.confirm(
+                "First time with this camera",
+                "You have not connected to %s from this program before.\n\nIts identity is\n%s\n\n"
+                "Continue and remember it?" % (host, fp)):
+            return self.say("Cancelled.")
+        if state == "changed" and not self.confirm(
+                "This camera's identity changed",
+                "%s presents a different identity than last time.\n\nThat is normal after the camera was reset or "
+                "its firmware was reinstalled. It could also mean another device is answering at this address.\n\n"
+                "New identity: %s\n\nOnly continue if you reset or reinstalled this camera. Continue?" % (host, fp)):
+            return self.say("Cancelled.")
+        self.known.remember(self.current_host(), fp)
+        user = self.v["user"].get().strip() or "root"
+        password = self.v["ssh_password"].get()
+        keys = camera_ssh.find_key_files() if self.v["use_key"].get() else []
+
+        def work():
+            ex = camera_ssh.SshExecutor(host, port, user=user)
+            ex.connect(key, password=password or None, key_files=keys)
+            try:
+                info = camera_ssh.inspect(ex)
+                existing = camera_ssh.read_existing_config(ex)
+            except Exception:
+                ex.close()
+                raise
+            return ex, key, info, existing
+
+        self.run_task(work, lambda r, e: self.after_login(host, r, e), "Logging in…")
+
+    def after_login(self, host, result, error):
+        if self.ex:
+            self.ex.close()
+        self.ex, self.camera_ready = None, False
+        if error:
+            self.v["camera_status"].set("Not connected.")
+            return self.fail("Connect", error)
+        self.ex, self.host_key, info, existing = result
+        errors, warnings = camera_ssh.check_ready(info)
+        self.camera_ready = not errors
+        lines = ["Connected to %s (%s, logged in with your %s)." % (
+            info.get("hostname") or host, info.get("image") or "unknown model", self.ex.login)]
+        if info.get("build_time"):
+            lines.append("Firmware built %s." % info["build_time"])
+        lines.append("aiwatch is %s on this camera." % (
+            "installed%s" % (" and hooked to motion events" if info.get("hooked") == "yes" else ", but not hooked to motion events")
+            if info.get("aiwatch") == "yes" else "not installed"))
+        lines += ["Problem: " + e for e in errors] + ["Note: " + w for w in warnings]
+        self.v["camera_status"].set("%s — %s" % (info.get("hostname") or host, "ready" if self.camera_ready else "cannot be used"))
+        self.show(lines)
+        if existing and self.camera_ready and self.confirm(
+                "Load the camera's settings?",
+                "This camera already has aiwatch settings. Load them into the form so you can change them? "
+                "(The API key stays on the camera; leave the key box empty to keep it.)"):
+            self.fill(camera_ssh.settings_from_config(existing, base=self.collect()))
+            self.say("Loaded the camera's current settings.")
+        self.remember()
+
+    def need_camera(self):
+        if not self.ex or not self.camera_ready:
+            self.inform("Not connected", "Press Connect and check first. The camera must be running thingino.")
+            return False
+        return True
+
+    def remember(self):
+        try:
+            core.save_profile(self.collect(), self.current_host(), self.v["user"].get().strip() or "root")
+        except OSError:
+            pass
+
+    def install_ssh(self):
+        if not self.need_camera():
+            return
+        s = self.collect()
+        errors, warnings = core.check_settings(s)
+        if errors:
+            return self.error("Check the settings", "\n".join(errors))
+        if s["wifi_ssid"] and not self.confirm(
+                "Change the camera's Wi-Fi?",
+                "The camera is working on its current network. If this network name or password is wrong, or the "
+                "network is 5 GHz only, the camera goes offline until it is reset.\n\nChange the Wi-Fi anyway?"):
+            return
+        if warnings and not self.confirm("Check before installing", "\n\n".join(warnings) + "\n\nInstall anyway?"):
+            return
+        self.remember()
+        self.run_task(lambda: camera_ssh.install(self.ex, s, progress=self.say_later),
+                      lambda r, e: self.after_install(s, r, e), "Installing…")
+
+    def after_install(self, settings, result, error):
+        if error:
+            return self.fail("Install", error)
+        self.say("")
+        for line in result.log:
+            self.say("  " + line)
+        if not result.ok:
+            return self.error("The install had problems", "\n".join(result.errors))
+        self.say("Installed. Running a test on the camera…")
+        if result.restart_needed and self.confirm("Restart the camera?", "The Wi-Fi settings apply after a restart. "
+                                                   "Restart the camera now? (It is back in about a minute.)"):
+            return self.restart_ssh(ask=False)
+        self.test_ssh(False)
+
+    def test_ssh(self, send):
+        if not self.need_camera():
+            return
+        if send and not self.confirm("Send a real alert?", "This takes a snapshot, asks the model, and sends the alert "
+                                      "to your Telegram or ntfy. Continue?"):
+            return
+
+        def done(result, error):
+            if error:
+                return self.fail("Test", error)
+            ok, output = result
+            self.say(("Test result:\n" if ok else "The test failed:\n") + output)
+
+        self.run_task(lambda: camera_ssh.run_test(self.ex, send), done, "Testing on the camera (up to half a minute)…")
+
+    def uninstall_ssh(self):
+        if not self.need_camera():
+            return
+        if not self.confirm("Uninstall aiwatch?", "This removes aiwatch, its web page and the hook in the motion script "
+                             "from the camera. thingino itself stays."):
+            return
+        keep = self.confirm("Keep the settings?", "Keep the settings file (it holds your API key) on the camera, "
+                            "so a later install can reuse it?")
+
+        def done(lines, error):
+            if error:
+                return self.fail("Uninstall", error)
+            for line in lines:
+                self.say("  " + line)
+            self.say("Done." if not any(l.startswith("ERROR") for l in lines) else "Finished with problems.")
+
+        self.run_task(lambda: camera_ssh.uninstall(self.ex, keep_config=keep), done, "Removing…")
+
+    def restart_ssh(self, ask=True):
+        if not self.need_camera():
+            return
+        if ask and not self.confirm("Restart the camera?", "It is offline for about a minute."):
+            return
+
+        def done(_, error):
+            self.ex.close()
+            self.ex, self.camera_ready = None, False
+            self.v["camera_status"].set("Restarting… press Connect again in a minute.")
+            self.say("The camera is restarting. Press Connect and check in about a minute.")
+
+        self.run_task(lambda: camera_ssh.restart(self.ex), done)
+
+    def setup_key(self):
+        if not self.need_camera():
+            return
+        keys = camera_ssh.find_key_files()
+        if not keys:
+            if not self.confirm("Create an SSH key?", "You have no SSH key yet. Create one in your .ssh folder? "
+                                 "It stays on this computer; only its public half goes to the camera."):
+                return
+            try:
+                keys = [camera_ssh.create_key()]
+            except Exception as exc:  # no ssh-keygen, no write access, ...
+                return self.fail("SSH key", exc)
+            self.say("Created %s." % keys[0])
+        key = camera_ssh.load_key(keys[0])
+        if key is None:
+            return self.inform("SSH key", "Your key %s needs a passphrase, which this tool cannot use. Remove the "
+                               "passphrase or use another key." % keys[0].name)
+        (host, port), user, host_key = parse_address(self.v["host"].get()), self.v["user"].get().strip() or "root", self.host_key
+
+        def work():
+            added = camera_ssh.authorize_key(self.ex, camera_ssh.public_line(key))
+            check = camera_ssh.SshExecutor(host, port, user=user)
+            try:
+                check.connect(host_key, password=None, key_files=[keys[0]])  # the key alone, no password
+                check.run("true")
+            finally:
+                check.close()
+            return added
+
+        def done(added, error):
+            if error:
+                return self.fail("SSH key", "The key was sent but logging in with it did not work: %s" % error)
+            self.v["use_key"].set(True)
+            self.inform("Key login works", "%s Next time you can leave the password empty." %
+                        ("The key was added to the camera." if added else "The camera already had this key."))
+
+        self.run_task(work, done, "Setting up key login…")
+
+    # --- SD card ---
+
+    def refresh_drives(self):
+        drives = core.list_removable_drives()
+        self.drive_paths = {text: path for path, text in drives}
+        self.drive_box["values"] = [text for _, text in drives]
+        if drives and not self.v["target"].get():
+            self.v["target"].set(drives[0][1])
+
+    def browse(self):
         folder = filedialog.askdirectory(title="Choose the SD card or a folder")
         if folder:
-            target_var.set(folder)
+            self.v["target"].set(folder)
 
-    ttk.Button(card, text="Refresh", command=refresh_drives).grid(row=0, column=1, **pad)
-    ttk.Button(card, text="Browse\u2026", command=browse).grid(row=0, column=2, **pad)
-    ttk.Label(card, foreground="#666", wraplength=520, justify="left",
-              text="Files are added to the card; nothing is formatted or erased. "
-                   "Use a FAT32 card of 32 GB or less.").grid(
-        row=1, column=0, columnspan=3, sticky="w", **pad)
-    flash_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(card, variable=flash_var,
-                    text="Camera is still on Wyze firmware: also install thingino (25 MB download)").grid(
-        row=2, column=0, columnspan=2, sticky="w", **pad)
-    ttk.Button(card, text="About", command=lambda: webbrowser.open(THINGINO_INSTALL_URL)).grid(
-        row=2, column=2, **pad)
+    def write_sd(self):
+        s = self.collect()
+        flash = bool(self.v["flash"].get())
+        choice = self.v["target"].get().strip()
+        target = self.drive_paths.get(choice, choice)
+        errors, warnings = core.validate(s, target, flash)
+        if errors:
+            return self.error("Cannot write the card", "\n".join(errors))
+        if warnings and not self.confirm("Check before writing", "\n\n".join(warnings) + "\n\nWrite anyway?"):
+            return
+        if core.foreign_runonce(target) and not self.confirm(
+                "Replace runonce.sh?", "This card already has a runonce.sh that was not made by this tool.\n\nReplace it?"):
+            return
+        if flash and not self.confirm(
+                "Replace the Wyze firmware?",
+                "A camera started with this card will have its Wyze firmware replaced by thingino. The Wyze app will "
+                "stop working with it.\n\nThe installer first saves the Wyze firmware to the card in a WYZE_BACKUP "
+                "folder; that backup is the only way back.\n\nOnly for the Wyze Cam v3 (square face). Continue?"):
+            return
+        self.remember()
 
-    # --- tabs ---
-    tabs = ttk.Notebook(root)
-    tabs.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        def work():
+            done = []
+            last = [0.0]
 
-    wifi = ttk.Frame(tabs)
-    wifi.columnconfigure(1, weight=1)
-    tabs.add(wifi, text="2. Wi-Fi")
-    field(wifi, 0, "Network name", "wifi_ssid", hint="Leave empty to keep the camera's current Wi-Fi. 2.4 GHz only.")
-    secret_field(wifi, 2, "Password", "wifi_pass")
+            def progress(got, total):
+                if time.time() - last[0] > 1.0:
+                    last[0] = time.time()
+                    self.say_later("Downloading: %.0f MB%s" % (got / 1e6, " of %.0f MB" % (total / 1e6) if total else ""))
 
-    ai = ttk.Frame(tabs)
-    ai.columnconfigure(1, weight=1)
-    tabs.add(ai, text="3. AI")
-    ttk.Checkbutton(ai, text="Turn AI alerts on", variable=var["enabled"]).grid(
-        row=0, column=0, columnspan=2, sticky="w", **pad)
-    ttk.Checkbutton(ai, text="Turn the camera's motion detection on", variable=var["enable_motion"]).grid(
-        row=1, column=0, columnspan=2, sticky="w", **pad)
-    field(ai, 2, "Endpoint", "endpoint")
-    secret_field(ai, 3, "API key", "api_key")
-    field(ai, 4, "Model", "model", hint="A model that accepts images, as listed on openrouter.ai/models")
-    field(ai, 6, "Camera name", "camera_name")
-    field(ai, 7, "Scene", "context", hint="One line, such as: Front porch facing the street")
-    field(ai, 9, "Language", "language")
-    ttk.Label(ai, text="Alert rules").grid(row=10, column=0, sticky="nw", **pad)
-    rules_box = tk.Text(ai, height=4, width=40, wrap="word")
-    rules_box.grid(row=10, column=1, sticky="ew", **pad)
-    ttk.Label(ai, foreground="#666", text="One per line, up to 10. Empty: alert on anything notable.").grid(
-        row=11, column=1, sticky="w", padx=8)
-    limits = ttk.Frame(ai)
-    limits.grid(row=12, column=1, sticky="w")
-    ttk.Label(limits, text="Seconds between calls").grid(row=0, column=0, **pad)
-    ttk.Entry(limits, textvariable=var["cooldown"], width=6).grid(row=0, column=1, **pad)
-    ttk.Label(limits, text="Calls per day").grid(row=0, column=2, **pad)
-    ttk.Entry(limits, textvariable=var["daily_limit"], width=6).grid(row=0, column=3, **pad)
+            if flash:
+                self.say_later("Downloading the thingino installer…")
+                cache = core.image_cache_path()
+                fresh = core.download_thingino_image(cache, progress)
+                done.append("Downloaded the thingino installer" if fresh else "Used the thingino installer downloaded earlier")
+                files = core.read_thingino_files(cache)
+                self.say_later("Copying thingino to the card…")
+                done += core.write_thingino_files(target, files)
+            return done + core.prepare_card(target, s)
 
-    alerts = ttk.Frame(tabs)
-    alerts.columnconfigure(1, weight=1)
-    tabs.add(alerts, text="4. Alerts")
-    secret_field(alerts, 0, "Telegram bot token", "tg_token")
-    field(alerts, 1, "Telegram chat ID", "tg_channel")
-    ttk.Separator(alerts).grid(row=2, column=0, columnspan=3, sticky="ew", pady=6)
-    field(alerts, 3, "ntfy server", "ntfy_host")
-    field(alerts, 4, "ntfy topic", "ntfy_topic", hint="Leave a service empty to skip it.")
-
-    # --- write ---
-    bottom = ttk.Frame(root)
-    bottom.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 10))
-    bottom.columnconfigure(0, weight=1)
-    log = tk.Text(bottom, height=8, width=60, wrap="word", state="disabled")
-    log.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-
-    def show(lines):
-        log.configure(state="normal")
-        log.delete("1.0", "end")
-        log.insert("end", "\n".join(lines))
-        log.configure(state="disabled")
-
-    def collect():
-        settings = {key: (v.get().strip() if isinstance(v, tk.StringVar) else bool(v.get()))
-                    for key, v in var.items()}
-        settings["wifi_pass"] = var["wifi_pass"].get()  # spaces can be part of a password
-        settings["rules"] = [line.strip() for line in rules_box.get("1.0", "end").splitlines() if line.strip()]
-        return settings
-
-    def finish(target, done, flash):
-        if flash:
-            steps = [
+        def finish(done, error):
+            if error:
+                return self.fail("Writing failed", error)
+            steps = ([
                 "1. Eject the card safely. Unplug the camera, put the card in, plug it back in.",
-                "2. Leave it alone for about six minutes. It backs up the Wyze firmware to the "
-                "card, installs thingino, restarts, applies your settings and restarts again.",
-                "3. Afterwards, copy the WYZE_BACKUP folder from the card to your computer. "
-                "It is the only way back to Wyze firmware and is unique to this camera.",
-                "4. wyzer/install.log on the card lists what was set up.",
-            ]
-        else:
-            steps = [
+                "2. Leave it alone for about six minutes. It backs up the Wyze firmware to the card, installs "
+                "thingino, restarts, applies your settings and restarts again.",
+                "3. Afterwards copy the WYZE_BACKUP folder from the card to your computer. It is the only way back "
+                "to Wyze firmware and is unique to this camera.",
+                "4. wyzer/install.log on the card lists what was set up."] if flash else [
                 "1. Eject the card safely and put it in the camera.",
                 "2. Power the camera on and leave it for about two minutes; it restarts once.",
-                "3. Afterwards wyzer/install.log on the card lists what was done.",
-            ]
-        show(done + ["", "Card is ready: %s" % target] + steps +
-             ["Keys and passwords are deleted from the card once the camera has read them."])
+                "3. Afterwards wyzer/install.log on the card lists what was done."])
+            self.show(done + ["", "Card is ready: %s" % target] + steps +
+                      ["Keys and passwords are deleted from the card once the camera has read them."])
 
-    def work(target, settings, flash):
-        # Runs off the UI thread; talks to the window only through root.after.
-        def status(text):
-            root.after(0, lambda: show([text]))
+        self.run_task(work, finish, "Writing the card…")
 
-        def progress(done_bytes, total_bytes):
-            now = time.time()
-            if now - progress.last > 0.3:
-                progress.last = now
-                total = " of %.0f MB" % (total_bytes / 1e6) if total_bytes else ""
-                status("Downloading the thingino installer: %.0f MB%s" % (done_bytes / 1e6, total))
 
-        progress.last = 0.0
-        try:
-            done = []
-            if flash:
-                status("Downloading the thingino installer…")
-                cache = image_cache_path()
-                fresh = download_thingino_image(cache, progress)
-                done.append("Downloaded the thingino installer" if fresh
-                            else "Used the thingino installer downloaded earlier")
-                status("Checking the installer image…")
-                files = read_thingino_files(cache)
-                status("Copying thingino to the card…")
-                done += write_thingino_files(target, files)
-            done += prepare_card(target, settings)
-        except Exception as exc:  # shown to the user; nothing else can handle it here
-            message = str(exc) or exc.__class__.__name__
-            root.after(0, lambda: (show(["Stopped: " + message]),
-                                   messagebox.showerror("Writing failed", message),
-                                   write_button.state(["!disabled"])))
-            return
-        root.after(0, lambda: (finish(target, done, flash), write_button.state(["!disabled"])))
+def parse_address(text):
+    """"192.168.1.5", "192.168.1.5:2222" or the combobox's "192.168.1.5    thingino camera" -> (host, port)."""
+    parts = text.split()
+    if not parts:
+        return "", 22
+    host, _, port = parts[0].rpartition(":")
+    if host and port.isdigit() and ":" not in host:
+        return host, int(port)
+    return parts[0], 22
 
-    def write():
-        settings = collect()
-        flash = bool(flash_var.get())
-        choice = target_var.get().strip()
-        target = drive_paths.get(choice, choice)
-        errors, warnings = validate(settings, target, flash)
-        if errors:
-            messagebox.showerror("Cannot write the card", "\n".join(errors))
-            return
-        if warnings and not messagebox.askyesno("Check before writing", "\n\n".join(warnings) + "\n\nWrite anyway?"):
-            return
-        if foreign_runonce(target) and not messagebox.askyesno(
-                "Replace runonce.sh?",
-                "This card already has a runonce.sh that was not made by this tool.\n\nReplace it?"):
-            return
-        if flash and not messagebox.askyesno(
-                "Replace the Wyze firmware?",
-                "A camera started with this card will have its Wyze firmware replaced by thingino. "
-                "The Wyze app will stop working with it.\n\n"
-                "The installer first saves the Wyze firmware to the card in a WYZE_BACKUP folder; "
-                "that backup is the only way back.\n\n"
-                "Only for the Wyze Cam v3 (square face). Continue?"):
-            return
-        write_button.state(["disabled"])
-        threading.Thread(target=work, args=(target, settings, flash), daemon=True).start()
 
-    write_button = ttk.Button(bottom, text="Write to SD card", command=write)
-    write_button.grid(row=0, column=0, sticky="e")
-
-    refresh_drives()
-    show(["Fill in the tabs, then press Write to SD card."])
+def run_gui():
+    root = tk.Tk()
+    app = InstallerApp(root)
+    root.app = app
     return root
 
 

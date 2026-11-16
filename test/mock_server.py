@@ -2,8 +2,11 @@
 
 Usage: mock_server.py PORT STATE_DIR
 
-Reads the reply to give from STATE_DIR/mode and stores each request body in
-STATE_DIR/request.json and its Authorization header in STATE_DIR/auth.
+STATE_DIR/mode picks the reply. It is either one word, used for every model,
+or a JSON object mapping model ids to words ("*" is the default):
+  {"*": "notify", "free/a:free": "429"}
+Every request is logged: its body in request.json, its Authorization header in
+auth, and one line per request with the model id in hits.log.
 """
 import json
 import os
@@ -19,7 +22,18 @@ ANSWERS = {
     "fenced": '```json\n{"description": "A dog runs across the lawn.",\n "notify": true, "rule": ""}\n```',
     "tricky": '{"description": "Sign says \\"50% off\\" \\\\ sale it\'s `id` $(id)", "notify": true, "rule": ""}',
     "prose": "I can see a driveway.",
+    "empty": "",
 }
+ERRORS = {"error": 500, "429": 429, "401": 401, "402": 402, "404": 404}
+
+
+def mode_for(model):
+    with open(os.path.join(STATE, "mode")) as f:
+        text = f.read().strip()
+    if text.startswith("{"):
+        modes = json.loads(text)
+        return modes.get(model, modes.get("*", "notify"))
+    return text
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -32,13 +46,17 @@ class Handler(BaseHTTPRequestHandler):
             f.write(body)
         with open(os.path.join(STATE, "auth"), "w") as f:
             f.write(self.headers.get("Authorization", ""))
+        model = json.loads(body).get("model", "")
         with open(os.path.join(STATE, "hits"), "a") as f:
             f.write("x")
-        with open(os.path.join(STATE, "mode")) as f:
-            mode = f.read().strip()
+        with open(os.path.join(STATE, "hits.log"), "a", newline="\n") as f:  # no CRLF on Windows
+            f.write(model + "\n")
 
-        if mode == "error":
-            code, reply = 500, {"error": {"message": "upstream exploded"}}
+        mode = mode_for(model)
+        if mode in ERRORS:
+            code = ERRORS[mode]
+            message = "upstream exploded" if mode == "error" else "mock %s" % mode
+            reply = {"error": {"message": message, "code": code}}
         else:
             code = 200
             reply = {"choices": [{"message": {"role": "assistant", "content": ANSWERS[mode]}}]}

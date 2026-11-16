@@ -1,0 +1,3 @@
+# Only the SSH tab needs this; the SD card tab uses the standard library alone.
+# Tested with paramiko 5.0.0.
+paramiko

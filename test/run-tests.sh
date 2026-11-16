@@ -62,6 +62,10 @@ config() {
   "services": ${SERVICES:-[\"telegram\"]},
   "send_photo": true,
   "fallback_on_error": ${FALLBACK:-true},
+  "free_pool": ${POOL_ON:-false},
+  "free_models": ${POOL:-[]},
+  "free_daily_limit": ${FREE_LIMIT:-45},
+  "max_attempts": ${ATTEMPTS:-3},
   "cooldown": ${COOLDOWN:-0},
   "daily_limit": ${LIMIT:-200}
 }
@@ -69,7 +73,7 @@ EOF
 }
 
 reset() {
-	rm -rf "$T/state" "$T/sent" "$T/log" "$SRV/hits" "$SRV/request.json" "$SRV/auth"
+	rm -rf "$T/state" "$T/sent" "$T/log" "$SRV/hits" "$SRV/hits.log" "$SRV/request.json" "$SRV/auth"
 	echo "${1:-notify}" >"$SRV/mode"
 }
 
@@ -95,6 +99,18 @@ check() {
 	fi
 }
 
+check_eq() {
+	# $1 name, $2 actual, $3 expected (exactly)
+	if [ "$2" = "$3" ]; then
+		PASS=$((PASS + 1))
+	else
+		FAIL=$((FAIL + 1))
+		echo "FAIL: $1"
+		echo "  expected: $3"
+		echo "  actual:   $2"
+	fi
+}
+
 # --- tests -------------------------------------------------------------------
 ENABLED=false config; reset
 run motion
@@ -106,7 +122,8 @@ run motion
 check "notify: one API call" "$(hits)" "1"
 check "notify: telegram gets description" "$(sent)" "send2telegram [-S] [-m] [A courier leaves a parcel at the door.] photo=yes"
 check "notify: bearer key sent" "$(cat "$SRV/auth")" "Bearer sk-test-123"
-check "notify: event logged" "$(cat "$T/state/events.jsonl")" '"status":"ok","notify":true,"description":"A courier leaves a parcel at the door.","rule":"A person is at the door"'
+check "notify: event logged" "$(cat "$T/state/events.jsonl")" '"status":"ok","notify":true,"description":"A courier leaves a parcel at the door.","rule":"A person is at the door","model":"test/vision"'
+check "usage: single model counted" "$(run usage json)" '[{"model":"test/vision","calls":1,"failures":0,"wait":0}]'
 REQ=$(python -I -c "
 import json,base64,sys
 d=json.load(open(sys.argv[1],encoding='utf-8'))
@@ -209,6 +226,59 @@ check "test -n: sends" "$(sent)" "send2telegram"
 
 OUT=$(run status 2>&1)
 check "status: shows model" "$OUT" "model: test/vision"
+
+models_tried() { tr '\n' ',' <"$SRV/hits.log" | sed 's/,$//'; }
+
+# --- rotating free models --------------------------------------------------
+POOL_ON=true POOL='["free/a:free","free/b:free","free/c:free"]' config
+reset '{"*":"notify","free/a:free":"429"}'
+run motion
+check_eq "pool: a rate limited, b answers" "$(models_tried)" "free/a:free,free/b:free"
+check "pool: event names the model" "$(cat "$T/state/events.jsonl")" '"model":"free/b:free"'
+check "pool: failure counted and held" "$(run usage json)" '{"model":"free/a:free","calls":1,"failures":1,"wait":'
+run motion
+check_eq "pool: next event starts after b and skips held a" "$(models_tried)" "free/a:free,free/b:free,free/c:free"
+run motion
+check_eq "pool: then wraps round, a still held" "$(models_tried)" "free/a:free,free/b:free,free/c:free,free/b:free"
+OUT=$(run usage)
+check "usage table: mode line" "$OUT" "mode: rotating free models (4 of 45 calls used today)"
+check "usage table: held model" "$OUT" "after an error"
+python -I -c "import json,sys; json.loads(sys.argv[1])" "$(run usage json)"
+check "usage json parses" "$?" "0"
+
+ATTEMPTS=2 POOL_ON=true POOL='["free/a:free","free/b:free","free/c:free"]' config
+reset '{"*":"error"}'
+run motion
+check_eq "pool: gives up after max attempts" "$(models_tried)" "free/a:free,free/b:free"
+check "pool: all failed, plain alert sent" "$(sent)" "AI description unavailable"
+
+POOL_ON=true POOL='["free/a:free","free/b:free"]' config
+reset '{"*":"401"}'
+run motion
+check_eq "pool: rejected key stops at once" "$(models_tried)" "free/a:free"
+
+POOL_ON=true POOL='["free/a:free","free/b:free"]' reset notify
+POOL_ON=true POOL='["free/a:free","free/b:free"]' FREE_LIMIT=2 config
+reset notify
+run motion; run motion; run motion
+check_eq "pool: free daily cap stops calls" "$(models_tried)" "free/a:free,free/b:free"
+check "pool: free cap logged" "$(cat "$T/log")" "free model limit of 2 calls a day reached"
+
+POOL_ON=true POOL='[]' config; reset notify
+run motion
+check_eq "pool: empty pool falls back to the model" "$(models_tried)" "test/vision"
+
+POOL_ON=true POOL='["bad id;rm","free/x:free","free/x:free"]' config; reset notify
+run motion
+check_eq "pool: invalid and duplicate ids ignored" "$(models_tried)" "free/x:free"
+
+POOL_ON=false POOL='["free/a:free"]' config; reset notify
+run motion
+check_eq "pool off: single model used" "$(models_tried)" "test/vision"
+
+POOL_ON=true POOL='["free/a:free","free/b:free"]' config; reset '{"*":"notify","free/a:free":"empty"}'
+run motion
+check_eq "pool: empty answer moves on" "$(models_tried)" "free/a:free,free/b:free"
 
 check "no work dirs left behind" "$(ls -d "${TMPDIR:-/tmp}"/aiwatch.?????? 2>/dev/null)" ""
 

@@ -73,9 +73,18 @@ case "$action" in
 		if [ -f "$STATE_DIR/events.jsonl" ]; then
 			events=$(tail -n 20 "$STATE_DIR/events.jsonl" | grep '^{.*}$' | awk 'NR > 1 { printf "," } { printf "%s", $0 }')
 		fi
+		# One entry per model used today. Same file format as `aiwatch usage json`:
+		# DAY MODEL CALLS FAILURES HOLD_UNTIL.
+		usage=""
+		if [ -f "$STATE_DIR/usage" ]; then
+			usage=$(awk -v day="$(date +%Y%m%d)" -v now="$(date +%s)" '
+				$1 == day && NF == 5 && $2 ~ /^[A-Za-z0-9._:\/-]+$/ {
+					printf "%s{\"model\":\"%s\",\"calls\":%d,\"failures\":%d,\"wait\":%d}", (n++ ? "," : ""), $2, $3, $4, ($5 > now ? $5 - now : 0)
+				}' "$STATE_DIR/usage")
+		fi
 		header "200 OK"
-		printf '{"ok":true,"installed":%s,"hooked":%s,"motion_enabled":%s,"calls_today":%s,"events":[%s]}\n' \
-			"$installed" "$hooked" "$motion" "$count" "$events"
+		printf '{"ok":true,"installed":%s,"hooked":%s,"motion_enabled":%s,"calls_today":%s,"usage":[%s],"events":[%s]}\n' \
+			"$installed" "$hooked" "$motion" "$count" "$usage" "$events"
 		;;
 
 	test | test_notify)
