@@ -101,6 +101,157 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(wi.foreign_runonce(self.tmp))
 
 
+def build_fat32_image(files, mbr=True):
+    """A minimal FAT32 disk image holding `files` ({name: bytes}) in its root."""
+    import struct
+
+    bps, clusters, reserved = 512, 70000, 32
+    fat_sectors = (clusters + 2) * 4 // bps + 1
+    total = reserved + 2 * fat_sectors + clusters
+    vol = bytearray(total * bps)
+    vol[0:3] = b"\xeb\x58\x90"
+    vol[3:11] = b"mkfs.fat"
+    struct.pack_into("<HBHBHHBH", vol, 11, bps, 1, reserved, 2, 0, 0, 0xF8, 0)
+    struct.pack_into("<II", vol, 32, total, fat_sectors)
+    struct.pack_into("<I", vol, 44, 2)
+    vol[510:512] = b"\x55\xaa"
+
+    root_clusters = 4
+    fat = [0x0FFFFFF8, 0x0FFFFFFF] + [0] * clusters
+    for c in range(2, 2 + root_clusters):
+        fat[c] = c + 1 if c < 1 + root_clusters else 0x0FFFFFFF
+    next_free = 2 + root_clusters
+    data_start = (reserved + 2 * fat_sectors) * bps
+    entries = bytearray()
+
+    for index, (name, content) in enumerate(files.items()):
+        short = ("F%05d~1BIN" % index).encode()  # 8.3 alias: exactly 11 bytes
+        checksum = 0
+        for byte in short:
+            checksum = ((checksum >> 1) | ((checksum & 1) << 7)) + byte & 0xFF
+        units = name.encode("utf-16-le") + b"\x00\x00"
+        units += b"\xff\xff" * (-(len(units) // 2) % 13)
+        pieces = [units[i:i + 26] for i in range(0, len(units), 26)]
+        for seq in range(len(pieces), 0, -1):
+            p = pieces[seq - 1]
+            flag = seq | (0x40 if seq == len(pieces) else 0)
+            entries += bytes([flag]) + p[0:10] + b"\x0f\x00" + bytes([checksum]) + p[10:22] + b"\x00\x00" + p[22:26]
+        first = next_free if content else 0
+        count = (len(content) + bps - 1) // bps
+        for i in range(count):
+            fat[next_free + i] = next_free + i + 1 if i < count - 1 else 0x0FFFFFFF
+        offset = data_start + (next_free - 2) * bps
+        vol[offset:offset + len(content)] = content
+        next_free += count
+        entry = bytearray(32)
+        entry[0:11] = short
+        entry[11] = 0x20
+        struct.pack_into("<H", entry, 20, first >> 16)
+        struct.pack_into("<H", entry, 26, first & 0xFFFF)
+        struct.pack_into("<I", entry, 28, len(content))
+        entries += entry
+
+    assert len(entries) <= root_clusters * bps and next_free <= clusters
+    vol[data_start:data_start + len(entries)] = entries
+    table = struct.pack("<%dI" % len(fat), *fat)
+    for n in range(2):
+        start = (reserved + n * fat_sectors) * bps
+        vol[start:start + len(table)] = table
+    if not mbr:
+        return bytes(vol)
+    head = bytearray(2048 * 512)
+    struct.pack_into("<BBBBBBBBII", head, 446, 0, 0, 0, 0, 0x0C, 0, 0, 0, 2048, total)
+    head[510:512] = b"\x55\xaa"
+    return bytes(head) + bytes(vol)
+
+
+BOOT = wi.UIMAGE_MAGIC + b"kernel" * 1000
+FIRMWARE = bytes(range(256)) * (wi.FIRMWARE_BYTES // 256)
+FW_NAME = "thingino-wyze_cam3_t31x_gc2053_rtl8189ftv.bin"
+
+
+class FlashTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wyzer-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def make_zip(self, files, name="sd.img", mbr=True):
+        import zipfile
+
+        path = self.tmp / "installer.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(name, build_fat32_image(files, mbr))
+        return path
+
+    def test_reads_installer_files_and_ignores_others(self):
+        path = self.make_zip({wi.THINGINO_BOOT_FILE: BOOT, FW_NAME: FIRMWARE,
+                              "autorun.sh": b"rm -rf /", "empty.txt": b""})
+        files = wi.read_thingino_files(path)
+        self.assertEqual(sorted(files), sorted([wi.THINGINO_BOOT_FILE, FW_NAME]))
+        self.assertEqual(files[wi.THINGINO_BOOT_FILE], BOOT)
+        self.assertEqual(files[FW_NAME], FIRMWARE)
+
+    def test_reads_image_without_partition_table(self):
+        files = wi.read_thingino_files(self.make_zip({wi.THINGINO_BOOT_FILE: BOOT, FW_NAME: FIRMWARE}, mbr=False))
+        self.assertEqual(len(files), 2)
+
+    def test_rejects_unexpected_images(self):
+        cases = {
+            "no valid": {wi.THINGINO_BOOT_FILE: b"not a kernel", FW_NAME: FIRMWARE},
+            "no Wyze Cam v3 firmware": {wi.THINGINO_BOOT_FILE: BOOT},
+            "not a 16 MB": {wi.THINGINO_BOOT_FILE: BOOT, FW_NAME: FIRMWARE[:-512]},
+        }
+        for message, files in cases.items():
+            with self.assertRaises(ValueError) as caught:
+                wi.read_thingino_files(self.make_zip(files))
+            self.assertIn(message, str(caught.exception))
+        with self.assertRaises(ValueError):
+            wi.read_thingino_files(self.make_zip({wi.THINGINO_BOOT_FILE: BOOT}, name="readme.txt"))
+        import zipfile
+        garbage = self.tmp / "garbage.zip"
+        with zipfile.ZipFile(garbage, "w") as z:
+            z.writestr("sd.img", b"\x00" * 4096)
+        with self.assertRaises(ValueError):
+            wi.read_thingino_files(garbage)
+
+    def test_write_and_prepare_share_a_card(self):
+        card = self.tmp / "card"
+        card.mkdir()
+        done = wi.write_thingino_files(card, {wi.THINGINO_BOOT_FILE: BOOT, FW_NAME: FIRMWARE})
+        wi.prepare_card(card, settings())
+        self.assertIn("1 firmware file", done[0])
+        self.assertEqual((card / wi.THINGINO_BOOT_FILE).read_bytes(), BOOT)
+        self.assertEqual((card / FW_NAME).stat().st_size, wi.FIRMWARE_BYTES)
+        self.assertTrue((card / "runonce.sh").exists())
+
+    def test_download_caches_and_rejects_non_zip(self):
+        source = self.make_zip({wi.THINGINO_BOOT_FILE: BOOT, FW_NAME: FIRMWARE})
+        dest = self.tmp / "cache" / "image.zip"
+        seen = []
+        self.assertTrue(wi.download_thingino_image(dest, lambda d, t: seen.append(d), url=source.as_uri()))
+        self.assertEqual(dest.read_bytes(), source.read_bytes())
+        self.assertTrue(seen)
+        self.assertFalse(wi.download_thingino_image(dest, url="http://127.0.0.1:9/unused"))  # cached
+
+        bad = self.tmp / "bad.bin"
+        bad.write_bytes(b"<html>not found</html>")
+        with self.assertRaises(ValueError):
+            wi.download_thingino_image(self.tmp / "other.zip", url=bad.as_uri())
+        self.assertFalse((self.tmp / "other.zip").exists())
+        self.assertFalse((self.tmp / "other.zip.part").exists())
+
+    def test_validate_flash_checks_space(self):
+        real = wi.card_info
+        self.addCleanup(setattr, wi, "card_info", real)
+        wi.card_info = lambda path: ("exFAT", 10 * 1024 * 1024)
+        errors, _ = wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp, flash=True)
+        self.assertEqual(len(errors), 2)
+        self.assertIn("FAT32", errors[0])
+        wi.card_info = lambda path: ("FAT32", 10 ** 9)
+        self.assertEqual(wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp, flash=True)[0], [])
+        self.assertEqual(wi.validate(settings(tg_token="t", tg_channel="1"), self.tmp)[0], [])
+
+
 @unittest.skipUnless(SH, "sh not found")
 class RunonceTests(unittest.TestCase):
     """Runs the card's runonce.sh against a fake camera root."""

@@ -31,6 +31,7 @@ you configure.
 | `patches/0002-config-add-aiwatch.patch` | Adds the package to thingino's menu |
 | `installer/wyzer_installer.py` | Window that prepares an SD card with aiwatch and your settings |
 | `installer/runonce.sh` | Script the camera runs from the card to install everything |
+| `installer/fatimage.py` | Reads files out of a FAT disk image, used for the thingino installer |
 | `test/` | Test suites with a mock endpoint and a fake camera; need `sh`, `curl`, `python` |
 
 The patches were made against thingino `ciao` at commit `c193194585b5`.
@@ -54,9 +55,27 @@ installer writes that script plus a `wyzer/` folder holding the aiwatch script
 and your settings. Keys and passwords are deleted from the card after the
 camera has read them.
 
-- **The camera must already run thingino.** This tool does not replace Wyze's firmware. For a stock camera, first use the [thingino Wyze Cam v3 installer](https://github.com/wltechblog/thingino-installers/tree/main/wyze-cam-3), which backs up the stock firmware and flashes thingino from an SD card.
 - **Nothing is formatted.** Files are copied onto the card as it is. Use a FAT32 card of 32 GB or less.
 - **Not tested on hardware yet.** The card contents and the on-camera script are covered by tests against a fake camera filesystem.
+
+### Cameras still on Wyze firmware
+
+Tick **Camera is still on Wyze firmware: also install thingino**. The tool then
+downloads the community
+[thingino installer for the Wyze Cam v3](https://github.com/wltechblog/thingino-installers/tree/main/wyze-cam-3)
+(about 25 MB, kept for a week in your local app data folder) and copies its
+files to the card: a boot file the stock bootloader loads from the card, and
+one firmware per hardware variant. The camera picks the right one itself.
+
+With that card in the camera, power on and leave it for about six minutes.
+It backs up the Wyze firmware to the card, installs thingino, restarts, then
+runs `runonce.sh` to apply your settings.
+
+- **Keep the backup.** Copy the `WYZE_BACKUP_...` folder from the card to your computer afterwards. It is the only way back to Wyze firmware and is unique to that camera.
+- **Wyze Cam v3 only** (square face). A v4 in a v3 base ignores the card and boots stock.
+- **The card must be FAT32.** The tool refuses other file systems for this step.
+- **How the files get on the card:** the upstream installer ships as a disk image meant to be written with an imaging tool. The image holds a single FAT32 partition and nothing outside it, so this tool reads the files out of the image and copies them, which needs no admin rights and cannot overwrite the wrong disk. Whether the stock bootloader accepts a card prepared this way has not been confirmed on a camera. If it does not start the install, write the upstream image with an imaging tool, then run this tool on that card without the tick.
+- **One card for both steps is also unconfirmed:** it relies on thingino finding `runonce.sh` on the card on its first boot after the install.
 
 ## Install by hand on a camera already running thingino
 

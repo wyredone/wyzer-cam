@@ -7,15 +7,39 @@ card is in the camera.
 
 Run:  python installer/wyzer_installer.py
 
+For a camera that is still on Wyze's firmware it can also put the thingino
+installer on the card: it downloads the community Wyze Cam v3 installer image
+and copies the files inside it to the card.
+
 Standard library only. The card is written with ordinary file copies; nothing
 is formatted and no disk is written raw.
 """
 
+import fnmatch
 import json
 import os
 import shutil
 import sys
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fatimage import FatError, FatImage  # noqa: E402
+
+# The thingino installer for the Wyze Cam v3, maintained by wltechblog. It is a
+# disk image holding one FAT32 partition with a boot file that the stock
+# bootloader loads from the card, plus one firmware per hardware variant.
+THINGINO_IMAGE_URL = ("https://raw.githubusercontent.com/wltechblog/thingino-installers/"
+                      "main/wyze-cam-3/wyze-cam-3-sd.zip")
+THINGINO_BOOT_FILE = "factory_t31_ZMC6tiIDQN"
+THINGINO_FIRMWARE_PATTERN = "thingino-wyze_cam3_*.bin"
+FIRMWARE_BYTES = 16 * 1024 * 1024  # the camera's flash size
+UIMAGE_MAGIC = b"\x27\x05\x19\x56"
+IMAGE_CACHE_DAYS = 7
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+FLASH_SPACE_BYTES = 64 * 1024 * 1024
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AIWATCH_SRC = REPO_ROOT / "package" / "thingino-aiwatch" / "files" / "aiwatch"
@@ -85,12 +109,109 @@ def services(settings):
     return result
 
 
-def validate(settings, target):
+def card_info(path):
+    """(file system name or None if unknown, free bytes) for the card."""
+    fs_name = None
+    if sys.platform == "win32":
+        import ctypes
+
+        root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
+        fs = ctypes.create_unicode_buffer(261)
+        if ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs, 261):
+            fs_name = fs.value
+    return fs_name, shutil.disk_usage(str(path)).free
+
+
+def image_cache_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "wyzer-cam" / "wyze-cam-3-sd.zip"
+
+
+def download_thingino_image(dest, progress=None, url=THINGINO_IMAGE_URL):
+    """Downloads the installer image to `dest`, reusing a recent copy.
+
+    `progress(done_bytes, total_bytes)` is called while downloading.
+    Returns True if a download happened, False if the cached copy was used.
+    """
+    dest = Path(dest)
+    if (dest.is_file() and zipfile.is_zipfile(dest)
+            and time.time() - dest.stat().st_mtime < IMAGE_CACHE_DAYS * 86400):
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    with urllib.request.urlopen(url, timeout=30) as response, open(part, "wb") as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+            if done > MAX_DOWNLOAD_BYTES:
+                raise ValueError("the download is larger than expected; stopped")
+            out.write(chunk)
+            if progress:
+                progress(done, total)
+    if not zipfile.is_zipfile(part):
+        part.unlink()
+        raise ValueError("the downloaded file is not a zip archive")
+    os.replace(part, dest)
+    return True
+
+
+def read_thingino_files(zip_path):
+    """The installer's files from the downloaded image, as {name: bytes}.
+
+    Only the boot file and the Wyze Cam v3 firmware files are taken, and each
+    is checked, so an unexpected image is rejected instead of copied.
+    """
+    with zipfile.ZipFile(zip_path) as archive:
+        images = [i for i in archive.infolist() if i.filename.lower().endswith(".img")]
+        if len(images) != 1:
+            raise ValueError("expected one disk image in the download, found %d" % len(images))
+        if images[0].file_size > 1024 ** 3:
+            raise ValueError("the disk image in the download is larger than expected")
+        data = archive.read(images[0])  # also verifies the zip checksum
+
+    try:
+        found = {path: content for path, content in FatImage(data).files()
+                 if path == THINGINO_BOOT_FILE or fnmatch.fnmatchcase(path, THINGINO_FIRMWARE_PATTERN)}
+    except FatError as exc:
+        raise ValueError("could not read the installer image: %s" % exc)
+
+    boot = found.get(THINGINO_BOOT_FILE)
+    firmware = [name for name in found if name != THINGINO_BOOT_FILE]
+    if boot is None or not boot.startswith(UIMAGE_MAGIC):
+        raise ValueError("the installer image has no valid %s" % THINGINO_BOOT_FILE)
+    if not firmware:
+        raise ValueError("the installer image has no Wyze Cam v3 firmware")
+    for name in firmware:
+        if len(found[name]) != FIRMWARE_BYTES:
+            raise ValueError("%s is not a 16 MB firmware image" % name)
+    return found
+
+
+def write_thingino_files(target, files):
+    target = Path(target)
+    for name, content in files.items():
+        _write(target / name, content)
+    count = len(files) - 1
+    return ["Copied the thingino installer and %d firmware file%s" % (count, "" if count == 1 else "s")]
+
+
+def validate(settings, target, flash=False):
     """Returns (errors, warnings) as lists of sentences."""
     errors, warnings = [], []
     target = Path(target) if target else None
     if not target or not target.is_dir():
         errors.append("Choose the SD card (or a folder) to write to.")
+    elif flash:
+        fs_name, free = card_info(target)
+        if fs_name is not None and fs_name.upper() != "FAT32":
+            errors.append("To install thingino the card must be formatted FAT32; this one is %s. "
+                          "Cards over 32 GB usually are not." % fs_name)
+        if free < FLASH_SPACE_BYTES:
+            errors.append("The card needs at least 64 MB free for the thingino installer.")
 
     ssid, password = settings["wifi_ssid"], settings["wifi_pass"]
     if ssid:
@@ -228,6 +349,7 @@ def prepare_card(target, settings):
 # --- GUI ---------------------------------------------------------------------
 
 def run_gui():
+    import threading
     import tkinter as tk
     import webbrowser
     from tkinter import filedialog, messagebox, ttk
@@ -284,12 +406,15 @@ def run_gui():
     ttk.Button(card, text="Refresh", command=refresh_drives).grid(row=0, column=1, **pad)
     ttk.Button(card, text="Browse\u2026", command=browse).grid(row=0, column=2, **pad)
     ttk.Label(card, foreground="#666", wraplength=520, justify="left",
-              text="The camera must run thingino. Files are added to the card; nothing is "
-                   "formatted or erased. Use a FAT32 card of 32 GB or less.").grid(
+              text="Files are added to the card; nothing is formatted or erased. "
+                   "Use a FAT32 card of 32 GB or less.").grid(
         row=1, column=0, columnspan=3, sticky="w", **pad)
-    ttk.Button(card, text="Camera still on Wyze firmware? Open the thingino install guide",
-               command=lambda: webbrowser.open(THINGINO_INSTALL_URL)).grid(
-        row=2, column=0, columnspan=3, sticky="w", **pad)
+    flash_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(card, variable=flash_var,
+                    text="Camera is still on Wyze firmware: also install thingino (25 MB download)").grid(
+        row=2, column=0, columnspan=2, sticky="w", **pad)
+    ttk.Button(card, text="About", command=lambda: webbrowser.open(THINGINO_INSTALL_URL)).grid(
+        row=2, column=2, **pad)
 
     # --- tabs ---
     tabs = ttk.Notebook(root)
@@ -355,11 +480,65 @@ def run_gui():
         settings["rules"] = [line.strip() for line in rules_box.get("1.0", "end").splitlines() if line.strip()]
         return settings
 
+    def finish(target, done, flash):
+        if flash:
+            steps = [
+                "1. Eject the card safely. Unplug the camera, put the card in, plug it back in.",
+                "2. Leave it alone for about six minutes. It backs up the Wyze firmware to the "
+                "card, installs thingino, restarts, applies your settings and restarts again.",
+                "3. Afterwards, copy the WYZE_BACKUP folder from the card to your computer. "
+                "It is the only way back to Wyze firmware and is unique to this camera.",
+                "4. wyzer/install.log on the card lists what was set up.",
+            ]
+        else:
+            steps = [
+                "1. Eject the card safely and put it in the camera.",
+                "2. Power the camera on and leave it for about two minutes; it restarts once.",
+                "3. Afterwards wyzer/install.log on the card lists what was done.",
+            ]
+        show(done + ["", "Card is ready: %s" % target] + steps +
+             ["Keys and passwords are deleted from the card once the camera has read them."])
+
+    def work(target, settings, flash):
+        # Runs off the UI thread; talks to the window only through root.after.
+        def status(text):
+            root.after(0, lambda: show([text]))
+
+        def progress(done_bytes, total_bytes):
+            now = time.time()
+            if now - progress.last > 0.3:
+                progress.last = now
+                total = " of %.0f MB" % (total_bytes / 1e6) if total_bytes else ""
+                status("Downloading the thingino installer: %.0f MB%s" % (done_bytes / 1e6, total))
+
+        progress.last = 0.0
+        try:
+            done = []
+            if flash:
+                status("Downloading the thingino installer…")
+                cache = image_cache_path()
+                fresh = download_thingino_image(cache, progress)
+                done.append("Downloaded the thingino installer" if fresh
+                            else "Used the thingino installer downloaded earlier")
+                status("Checking the installer image…")
+                files = read_thingino_files(cache)
+                status("Copying thingino to the card…")
+                done += write_thingino_files(target, files)
+            done += prepare_card(target, settings)
+        except Exception as exc:  # shown to the user; nothing else can handle it here
+            message = str(exc) or exc.__class__.__name__
+            root.after(0, lambda: (show(["Stopped: " + message]),
+                                   messagebox.showerror("Writing failed", message),
+                                   write_button.state(["!disabled"])))
+            return
+        root.after(0, lambda: (finish(target, done, flash), write_button.state(["!disabled"])))
+
     def write():
         settings = collect()
+        flash = bool(flash_var.get())
         choice = target_var.get().strip()
         target = drive_paths.get(choice, choice)
-        errors, warnings = validate(settings, target)
+        errors, warnings = validate(settings, target, flash)
         if errors:
             messagebox.showerror("Cannot write the card", "\n".join(errors))
             return
@@ -369,21 +548,19 @@ def run_gui():
                 "Replace runonce.sh?",
                 "This card already has a runonce.sh that was not made by this tool.\n\nReplace it?"):
             return
-        try:
-            done = prepare_card(target, settings)
-        except OSError as exc:
-            messagebox.showerror("Writing failed", str(exc))
+        if flash and not messagebox.askyesno(
+                "Replace the Wyze firmware?",
+                "A camera started with this card will have its Wyze firmware replaced by thingino. "
+                "The Wyze app will stop working with it.\n\n"
+                "The installer first saves the Wyze firmware to the card in a WYZE_BACKUP folder; "
+                "that backup is the only way back.\n\n"
+                "Only for the Wyze Cam v3 (square face). Continue?"):
             return
-        show(done + [
-            "",
-            "Card is ready: %s" % target,
-            "1. Eject the card safely and put it in the camera.",
-            "2. Power the camera on and leave it for about two minutes; it restarts once.",
-            "3. Afterwards wyzer/install.log on the card lists what was done.",
-            "Keys and passwords are deleted from the card once the camera has read them.",
-        ])
+        write_button.state(["disabled"])
+        threading.Thread(target=work, args=(target, settings, flash), daemon=True).start()
 
-    ttk.Button(bottom, text="Write to SD card", command=write).grid(row=0, column=0, sticky="e")
+    write_button = ttk.Button(bottom, text="Write to SD card", command=write)
+    write_button.grid(row=0, column=0, sticky="e")
 
     refresh_drives()
     show(["Fill in the tabs, then press Write to SD card."])
