@@ -29,12 +29,36 @@ you configure.
 | `package/thingino-aiwatch/` | Buildroot package: the `aiwatch` script, default config, `Config.in`, `.mk` |
 | `patches/0001-motion-call-aiwatch.patch` | Makes thingino's motion script call `aiwatch motion` |
 | `patches/0002-config-add-aiwatch.patch` | Adds the package to thingino's menu |
-| `test/` | Test suite with a mock endpoint; runs on any machine with `sh`, `curl`, `python` |
+| `installer/wyzer_installer.py` | Window that prepares an SD card with aiwatch and your settings |
+| `installer/runonce.sh` | Script the camera runs from the card to install everything |
+| `test/` | Test suites with a mock endpoint and a fake camera; need `sh`, `curl`, `python` |
 
 The patches were made against thingino `ciao` at commit `c193194585b5`.
 Only the prudynt streamer (the stable branch) is supported; raptor is not.
 
-## Try it on a camera already running thingino
+## Install with the SD card installer
+
+A small window that puts aiwatch and your settings on an SD card. It needs
+Python 3.8 or newer and nothing else.
+
+```bash
+python installer/wyzer_installer.py
+```
+
+1. Pick the SD card, fill in Wi-Fi, the API key and model, your alert rules, and Telegram or ntfy details.
+2. Press **Write to SD card**, eject the card, put it in the camera and power it on.
+3. The camera reads the card, installs everything, and restarts once. `wyzer/install.log` on the card lists what it did.
+
+How it works: thingino runs a `runonce.sh` found on the SD card once. The
+installer writes that script plus a `wyzer/` folder holding the aiwatch script
+and your settings. Keys and passwords are deleted from the card after the
+camera has read them.
+
+- **The camera must already run thingino.** This tool does not replace Wyze's firmware. For a stock camera, first use the [thingino Wyze Cam v3 installer](https://github.com/wltechblog/thingino-installers/tree/main/wyze-cam-3), which backs up the stock firmware and flashes thingino from an SD card.
+- **Nothing is formatted.** Files are copied onto the card as it is. Use a FAT32 card of 32 GB or less.
+- **Not tested on hardware yet.** The card contents and the on-camera script are covered by tests against a fake camera filesystem.
+
+## Install by hand on a camera already running thingino
 
 No rebuild needed. Replace `CAM` with the camera's address.
 
@@ -136,6 +160,10 @@ MQTT and webhook receive a JSON payload:
 
 ```bash
 sh test/run-tests.sh
+```
+
+```bash
+python -m unittest discover -s test
 ```
 
 ## License
