@@ -1,0 +1,19 @@
+config BR2_PACKAGE_THINGINO_AIWATCH
+	bool "thingino-aiwatch"
+	depends on BR2_PACKAGE_PRUDYNT_T
+	select BR2_PACKAGE_THINGINO_JCT
+	select BR2_PACKAGE_THINGINO_LIBCURL
+	select BR2_PACKAGE_THINGINO_SEND2
+	help
+	  AI descriptions and plain-language alert rules for motion events.
+
+	  On motion, sends one snapshot to an OpenAI-compatible
+	  chat-completions endpoint (OpenRouter by default, or a server on
+	  the LAN) and forwards the one-line description through the send2
+	  notifiers when an alert rule matches.
+
+	  Off by default: it sends camera frames to the configured endpoint.
+	  Configure in /etc/aiwatch.json.
+
+comment "thingino-aiwatch needs the prudynt streamer"
+	depends on !BR2_PACKAGE_PRUDYNT_T

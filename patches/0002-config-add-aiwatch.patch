@@ -1,0 +1,10 @@
+--- a/Config.in	2026-11-15 20:25:21.644831900 -0600
++++ b/Config.in	2026-11-15 20:25:22.019338300 -0600
+@@ -209,6 +209,7 @@
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/nino/Config.in"
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/send2xmpp/Config.in"
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-agent/Config.in"
++source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-aiwatch/Config.in"
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-send2/Config.in"
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-esphome/Config.in"
+ source "$BR2_EXTERNAL_THINGINO_PATH/package/thingino-freetype/Config.in"

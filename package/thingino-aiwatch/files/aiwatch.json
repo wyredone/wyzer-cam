@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "api_key": "",
+  "model": "",
+  "camera_name": "",
+  "context": "",
+  "language": "English",
+  "rules": [],
+  "filter_empty": true,
+  "services": ["telegram"],
+  "send_photo": true,
+  "fallback_on_error": true,
+  "cooldown": 60,
+  "daily_limit": 200,
+  "snapshot_channel": 1,
+  "max_image_kb": 600,
+  "timeout": 30
+}

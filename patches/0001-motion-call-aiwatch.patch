@@ -1,0 +1,12 @@
+--- a/package/prudynt-t/files/motion	2026-11-15 20:25:21.363142000 -0600
++++ b/package/prudynt-t/files/motion	2026-11-15 20:25:22.007654900 -0600
+@@ -90,6 +90,9 @@
+ 	# Trigger the Wyze Floodlight v1 night-time motion lamp (if installed)
+ 	[ -x /usr/sbin/floodlight_ctl ] && floodlight_ctl motion &
+ 
++	# Describe the event with a vision model and alert by rule (if installed)
++	[ -x /usr/sbin/aiwatch ] && aiwatch motion >/dev/null 2>&1 &
++
+ 	# Audible alert needs no captured media: fire it before the capture so a
+ 	# long clip does not delay it.
+ 	if [ "true" = "$(get_value playonspeaker)" ]; then
