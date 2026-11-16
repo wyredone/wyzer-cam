@@ -26,16 +26,20 @@ you configure.
 
 | Path | What it is |
 |---|---|
+| `thingino/` | Thingino firmware as a git submodule, pinned to `ciao` `c193194585b5` |
 | `package/thingino-aiwatch/` | Buildroot package: the `aiwatch` script, default config, `Config.in`, `.mk` |
 | `patches/0001-motion-call-aiwatch.patch` | Makes thingino's motion script call `aiwatch motion` |
 | `patches/0002-config-add-aiwatch.patch` | Adds the package to thingino's menu |
+| `scripts/prepare-thingino.sh` | Copies the package in, applies both patches, enables aiwatch on the v3 configs (`make prepare`) |
 | `installer/wyzer_installer.py` | Window that prepares an SD card with aiwatch and your settings |
 | `installer/runonce.sh` | Script the camera runs from the card to install everything |
 | `installer/fatimage.py` | Reads files out of a FAT disk image, used for the thingino installer |
 | `test/` | Test suites with a mock endpoint and a fake camera; need `sh`, `curl`, `python` |
 
-The patches were made against thingino `ciao` at commit `c193194585b5`.
-Only the prudynt streamer (the stable branch) is supported; raptor is not.
+The patches were made against thingino `ciao` at commit `c193194585b5`,
+which is the submodule pin. Only the prudynt streamer (the stable branch)
+is supported; raptor is not. The firmware in the community installer is an
+older `ciao` build; see [Build it into the firmware](#build-it-into-the-firmware).
 
 ## Install with the SD card installer
 
@@ -159,20 +163,52 @@ jct /etc/aiwatch.json set enabled true
 
 ## Build it into the firmware
 
+Thingino lives in this repo as a submodule at `thingino/`, pinned to `ciao`
+commit `c193194585b5` (`c193194585b5bcd064d535787b144ee4054e3f04`). That is
+the commit the two patches were made against, and both apply there with
+`git apply --check`.
+
+The community installer this project downloads,
+[wyze-cam-3-sd.zip](https://github.com/wltechblog/thingino-installers/blob/main/wyze-cam-3/wyze-cam-3-sd.zip)
+(installers commit `4d8530f`, "Update firmwares", 2026-08-14), is release
+`firmware-2026-08-14` of the same `ciao` branch, commit `2c3eca50a774`.
+The zip's SD image holds these three 16 MB images, and each file's SHA-256
+matches the checksum published with that release (`ciao+2c3eca5`):
+
+- `thingino-wyze_cam3_t31al_gc2053_atbm6031.bin`
+- `thingino-wyze_cam3_t31x_gc2053_atbm6031.bin`
+- `thingino-wyze_cam3_t31x_gc2053_rtl8189ftv.bin`
+
+`git apply --check` fails on `2c3eca50a774`. Patch 0001 looks for the
+floodlight hook in `package/prudynt-t/files/motion`, and that hook is not in
+the August file. Patch 0002 looks for the `send2xmpp` and `thingino-send2`
+lines in `Config.in`, and those lines are not there yet. The submodule stays
+on `c193194585b5`, where both patches apply unchanged. A firmware built from
+it is a newer `ciao` than the image the installer writes. The installer's
+own README asks for a full upgrade after the first flash.
+
 ```bash
-git clone --recurse-submodules -b ciao https://github.com/themactep/thingino-firmware
+git submodule update --init --recursive
 ```
 
-Copy `package/thingino-aiwatch` into the clone's `package/` directory, apply
-both patches with `git apply`, and add this line to the camera's defconfig,
-for example `configs/cameras/wyze_cam3_t31x_gc2053_rtl8189ftv/`:
-
-```
-BR2_PACKAGE_THINGINO_AIWATCH=y
+```bash
+make prepare
 ```
 
-Then build as usual with `make`. The Wyze Cam v3 has three hardware variants in
-thingino; pick the config that matches your unit's SoC and Wi-Fi chip.
+The first command checks out thingino and its `buildroot` submodule. The
+second copies `package/thingino-aiwatch` into the thingino tree, applies
+both patches, and adds `BR2_PACKAGE_THINGINO_AIWATCH=y` to all three Wyze
+Cam v3 defconfigs. Those edits stay in the thingino checkout.
+
+Then build the variant that matches the camera:
+
+```bash
+make -C thingino CAMERA=wyze_cam3_t31x_gc2053_rtl8189ftv
+```
+
+The other two variants are `wyze_cam3_t31x_gc2053_atbm6031` and
+`wyze_cam3_t31al_gc2053_atbm6031`. On `ciao`, prudynt is the default
+streamer, which is what aiwatch depends on.
 
 ## Configuration
 
@@ -215,7 +251,7 @@ MQTT and webhook receive a JSON payload:
 
 ## Things to know
 
-- **Older thingino builds:** aiwatch was written against the current stable branch. On builds from mid-2026 the settings page, Telegram, MQTT and webhook alerts are expected to work, but ntfy needs the server set as a full `https://` address under Send to services. Updating thingino first avoids this; a full update erases aiwatch, so install it again afterwards.
+- **Older thingino builds:** aiwatch was written against `ciao` at `c193194585b5`. The community Wyze Cam v3 installer ships `firmware-2026-08-14` (`ciao` `2c3eca50a774`). On builds from mid-2026 the settings page, Telegram, MQTT and webhook alerts are expected to work, but ntfy needs the server set as a full `https://` address under Send to services. Updating thingino first avoids this; a full update erases aiwatch, so install it again afterwards.
 - **Model text is made inert:** quotes in descriptions become typographic quotes and `` ` ``, `$` and `\` are removed before the text reaches a notifier, because older notifier scripts pass it through a shell.
 - **Duplicate alerts:** if thingino's own motion notifications are also on for the same service, you get two messages per event. Turn the plain one off.
 - **Key storage:** the camera's flash is not encrypted. Use a dedicated API key with a spending limit.
